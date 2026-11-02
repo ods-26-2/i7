@@ -14,8 +14,8 @@ import numpy as np
 from fast_alpr import ALPR
 
 # =========================== VARIÁVEIS GLOBAIS ===========================
-PASTA_IMAGENS = "/media/gabriel/HD-Gabriel/ODS/imagensTeste"          # pasta com as imagens de teste
-PASTA_SAIDA = "/media/gabriel/HD-Gabriel/ODS/saida_mosaicos/saida4classesV4-fastalpr"          # mosaicos + resultados.csv
+PASTA_IMAGENS = "/home/gabriel/Desktop/ODS/ImgsTesteModelo"          # pasta com as imagens de teste
+PASTA_SAIDA = "/home/gabriel/Desktop/ODS/saida_mosaicos/saida4classesV4-fastalpr"          # mosaicos + resultados.csv
 
 CONF_DETECCAO = 0.25                     # confiança mínima do detector
 MOSTRAR_JANELA = False                   # False = Apenas salva (sem janelas na tela)
