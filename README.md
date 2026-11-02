@@ -30,6 +30,7 @@ O modelo de 4 classes já informa o tipo da placa, o que permite aplicar uma val
 | `aplicacaoModelov4-fastalpr.py` | Fast-ALPR completo (detector + OCR) |
 | `aplicacaoModelov5-fast_rodosol.py` | YOLO próprio (4 classes) + OCR do Fast-ALPR |
 | `comprovacaoResultados.py` | Gera gráficos de desempenho a partir do `resultados.csv` |
+| `converterDataset-YOLO.py` | Código usado apenas para converter as anotações do dataset RODOSOL para o formato YOLO, usado no treinamento dos dois modelos |
  
 
 ## Como usar
