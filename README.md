@@ -92,7 +92,7 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `PUBLICACAO_MODO` | `arquivo` | `arquivo` (`kafka` só para publicar de verdade) | `arquivo` grava `eventos.jsonl`; `kafka` envia ao broker; `desligado` não gera eventos |
 | `SOURCE_ID` | `cam-entrada` | `cam-entrada` | Câmera/portão de origem do evento |
 | `ARTIFACT_VERSION` | modelo YOLO + OCR | opcional | Versão do artefato no evento |
-| `PUBLICACAO_MOCKAR_PENDENTES` | `nao` | `nao` | `sim` preenche `character_confidences` e `uncertain` com valores FALSOS, só para testar o fluxo |
+| `LIMIAR_INCERTEZA` | `0.9` | `0.9` | Se a menor confiança entre os caracteres ficar abaixo disso, o evento sai com `uncertain: true` |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
 | `KAFKA_BROKER` | `34.66.235.91:9093` | idem (temporário) | Endereço do broker; na versão final será local |
 
@@ -127,17 +127,22 @@ Cada leitura **aceita pela validação de formato** vira um evento `ods.i7.plate
 | `plate_layout` | `MERCOSUL` ou `OLD_BR` |
 | `class` | `car` (placa de 1 linha) ou `motorcycle` (2 linhas). Inferido da classe do YOLO |
 | `confidence` | **Menor** confiança entre os 7 caracteres (0 a 1). Foi a medida que melhor separou leituras certas de erradas; use ≥ 0,9 como regra de liberação |
+| `character_confidences` | Lista com a confiança (0 a 1) de cada um dos 7 caracteres da placa final, na mesma ordem de `license_plate` |
+| `uncertain` | `true` se a menor confiança (`confidence`) ficou abaixo de `LIMIAR_INCERTEZA` |
+| `detection_id` | Número da detecção dentro do frame (0, 1, 2…). Por enquanto é só um índice; quando houver acompanhamento da placa entre frames, passará a identificar o veículo |
 | `bbox` | `[x_min, y_min, x_max, y_max]` da placa na imagem |
 | `frame_index` | Posição da imagem dentro da pasta processada (começa em 0) |
 
 ```json
 {
-  "message_type": "event", "message_id": "…", "schema": "ods.i7.plate_read", "schema_version": "1.0",
+  "message_type": "event", "message_id": "…", "schema": "ods.i7.plate_read", "schema_version": "1.1",
   "producer": "I7", "occurred_at": "2026-11-04T11:34:44.886Z", "published_at": "2026-11-04T11:34:44.886Z",
   "captured_at": "2026-11-04T11:34:44.886Z", "source_id": "cam-entrada", "session_id": "…", "sequence": 0,
   "artifact_version": "modelo4classesV1+cct-s-v2-global",
   "payload": {"frame_index": 0, "class": "car", "plate_layout": "MERCOSUL",
-              "license_plate": "BRA2E19", "confidence": 0.94, "bbox": [1020, 640, 1190, 700]}
+              "detection_id": 0, "license_plate": "BRA2E19", "confidence": 0.94,
+              "character_confidences": [0.99, 0.98, 0.97, 0.95, 0.94, 0.96, 0.98], "uncertain": false,
+              "bbox": [1020, 640, 1190, 700]}
 }
 ```
 
@@ -185,7 +190,8 @@ Testados e descartados (80 imagens de `test`): remover o pré-processamento (59 
 - O formato válido da placa não garante leitura correta: a regex pode aprovar uma leitura errada. Por isso a avaliação compara com a placa verdadeira.
 - O erro mais comum é a primeira letra: `O` lido como `D` (15 casos em 800).
 - Os scripts de treino dos modelos YOLO (e a geração dos rótulos por classe) não estão neste repositório. O `converterDataset-YOLO.py` gera apenas a classe `plate`.
-- `character_confidences` e `uncertain`, exigidos pelo contrato, ainda não são produzidos (por isso o validador os trata como opcionais).
+- `detection_id` é, por ora, apenas o índice da detecção no frame; não acompanha o mesmo veículo entre frames (previsto para quando houver tracking/votação).
+- A versão do esquema (`schema_version`) passou de `1.0` para `1.1` ao incluir os três campos novos; eventos antigos já gravados no tópico não os têm.
 - O campo `class` do evento é inferido: 1 linha = `car`, 2 linhas = `motorcycle` (a confirmar com o TRA-1).
 - O nome do tópico (`ods.i7.plate_read`) segue o padrão `ods.<componente>.<evento>` dos tópicos já existentes (`ods.i1.detections`, `ods.i6.code_read`), e não os domínios sugeridos no guia (que lista `ods.veiculo.placa_lida` para o I7). A confirmar com o TRA-1.
 - O broker é temporário (Google Cloud, compartilhado); a versão final usará um broker local, e só o `KAFKA_BROKER` precisa mudar.

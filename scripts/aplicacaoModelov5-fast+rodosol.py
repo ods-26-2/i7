@@ -71,8 +71,9 @@ OCR_MODELO = os.getenv("OCR_MODELO", "global-plates-mobile-vit-v2-model")  # mod
 
 # --- Publicação de eventos (barramento) ---
 PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo", "kafka" ou "desligado"
-PUBLICACAO_MOCKAR_PENDENTES = os.getenv("PUBLICACAO_MOCKAR_PENDENTES", "nao").strip().lower() in (
-    "1", "true", "sim", "s", "yes")   # True: preenche character_confidences/uncertain com valores FALSOS
+# `uncertain` no evento = confiança mínima por caractere abaixo deste limiar (o a8 usa o mesmo valor
+# como mínimo para liberar a entrada: abaixo dele a leitura não abre a cancela sozinha)
+LIMIAR_INCERTEZA = env_numero("LIMIAR_INCERTEZA", 0.9)
 SOURCE_ID = os.getenv("SOURCE_ID", "cam-entrada")           # câmera/portão de origem
 ARTIFACT_VERSION = os.getenv("ARTIFACT_VERSION") or (
     f"{CAMINHO_MODELO_YOLO.parent.name}+{OCR_MODELO.removesuffix('-model')}")  # modelo + OCR usados
@@ -198,6 +199,38 @@ def processar_leitura(texto_bruto: str, rotulo_classe: str):
         return texto_validado, f"{rotulo_classe} (Inválida)"
 
     return limpo, f"{rotulo_classe} (Desconhecido)"
+
+
+def confiancas_dos_7_caracteres(texto_bruto: str, confidence) -> list[float] | None:
+    """
+    Confiança de cada um dos 7 caracteres da placa FINAL, alinhada ao texto do OCR.
+    Repete, sobre pares (caractere, confiança), as MESMAS operações de processar_leitura:
+    limpeza (só A-Z e 0-9), remoção de "BRASIL" e forcar_sete_caracteres. Assim, se um caractere
+    do texto bruto for descartado, a confiança dele é descartada junto.
+    Devolve None se não der para alinhar (o OCR não entregou uma confiança por caractere).
+    """
+    if not texto_bruto or not isinstance(confidence, (list, tuple)) or len(confidence) < len(texto_bruto):
+        return None
+
+    # limpeza básica (como em processar_leitura)
+    pares = [(c, float(confidence[i])) for i, c in enumerate(texto_bruto.upper()) if re.match(r"[A-Z0-9]", c)]
+
+    # remove "BRASIL" (da esquerda para a direita, sem sobreposição, como str.replace)
+    sem_brasil, i = [], 0
+    while i < len(pares):
+        if "".join(c for c, _ in pares[i:i + 6]) == "BRASIL":
+            i += 6
+        else:
+            sem_brasil.append(pares[i])
+            i += 1
+    pares = sem_brasil
+
+    # força 7 caracteres (como em forcar_sete_caracteres)
+    if len(pares) > 7:
+        sem_meio = pares[:3] + pares[4:]
+        pares = sem_meio if len(sem_meio) == 7 else pares[:7]
+
+    return [conf for _, conf in pares] if len(pares) == 7 else None
 
 
 def normalizar_confianca_ocr(confidence: float | list[float]) -> float:
@@ -458,8 +491,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
 
     interrompido = False
     with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
-            criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl",
-                             exigir_pendentes=PUBLICACAO_MOCKAR_PENDENTES) as publicador:
+            criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
         escritor = csv.writer(arq_csv)
         escritor.writerow(["imagem", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
                            "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char"])
@@ -479,7 +511,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
             resultados = []
             extras = []  # por placa, alinhada às listas acima: (texto bruto, confiança mínima, confianças)
 
-            for box in yolo_results.boxes:
+            for indice_deteccao, box in enumerate(yolo_results.boxes):
                 conf_det = float(box.conf[0])
                 cls_id = int(box.cls[0])
                 nome_classe_raw = modelo_yolo.names[cls_id]
@@ -528,11 +560,18 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
                 if (publicador.ativo and status_tipo == rotulo_classe
                         and nome_classe_raw in CLASSES_PARA_CONTRATO):
                     layout_placa, classe_veiculo = CLASSES_PARA_CONTRATO[nome_classe_raw]
-                    publicador.publicar(construtor.plate_read(
-                        placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
-                        confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
-                        bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=i - 1,
-                        captured_at=capturado_em))
+                    confs_7 = confiancas_dos_7_caracteres(texto_ocr, ocr_result.confidence if ocr_result else None)
+                    if confs_7 is None:
+                        print(f"[PUBLICAÇÃO] {caminho.name}: sem confiança por caractere alinhada; evento não publicado")
+                    else:
+                        publicador.publicar(construtor.plate_read(
+                            placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
+                            confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
+                            character_confidences=confs_7,
+                            uncertain=conf_min < LIMIAR_INCERTEZA,
+                            bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=i - 1,
+                            detection_id=indice_deteccao,  # GENÉRICO: índice da detecção no quadro (não acompanha o veículo)
+                            captured_at=capturado_em))
 
                 caixas.append((x1, y1, x2, y2, conf_det, status_tipo))
                 crops.append(entrada_ocr)  # no mosaico: o que o OCR "viu" (com margem / dobrada, se for o caso)
@@ -586,7 +625,7 @@ def main(limite: int | None = None):
         criar_publicador(PUBLICACAO_MODO, PASTA_SAIDA / "eventos.jsonl")
     except (ValueError, NotImplementedError) as erro:
         raise SystemExit(f"[ERRO] {erro}")
-    construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION, PUBLICACAO_MOCKAR_PENDENTES)
+    construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION)
 
     print(f"Detector: YOLO Próprio | OCR: Fast-ALPR ({OCR_MODELO}) | {len(pastas)} pasta(s) de imagens")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'} | "
@@ -597,8 +636,7 @@ def main(limite: int | None = None):
              f"descarte do topo {DOBRAR_DESCARTE_TOPO_PCT:g}%)" if DOBRAR_2L != "nao" else ""))
     print(f"Publicação: modo={PUBLICACAO_MODO} | source_id={SOURCE_ID} | "
           f"artifact_version={ARTIFACT_VERSION} | session_id={construtor.session_id}")
-    if PUBLICACAO_MOCKAR_PENDENTES:
-        print("[!] character_confidences e uncertain estão sendo MOCKADOS (valores falsos).")
+    print(f"Eventos: uncertain = confiança mínima < {LIMIAR_INCERTEZA:g} | detection_id = índice da detecção no quadro (genérico)")
     for pasta, saida in zip(pastas, saidas):
         print(f"  {pasta}  ->  {saida}")
 
