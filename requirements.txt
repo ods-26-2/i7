@@ -1,20 +1,21 @@
 # Python 3.10 ou mais novo (o v5 usa a sintaxe "float | list[float]").
 
-# --- Pipeline principal (v5) ---
+# --- Detecção e leitura de placas (aplicacaoModelov5-fast+rodosol.py) ---
 ultralytics>=8.4.168        # os .pt foram treinados com 8.3.203 e 8.4.168
-fast-alpr[onnx]>=0.4.0      # o "[onnx]" é obrigatório (veja abaixo)
-python-dotenv>=1.0
+fast-alpr[onnx]>=0.4.0      # o "[onnx]" é obrigatório (sem ele o import falha)
 opencv-python>=4.9
 numpy
-pillow                      # usado pelo conversor de dataset
 
-# --- Gráficos (comprovacaoResultados.py) ---
+# --- Configuração (.env) ---
+python-dotenv>=1.0
+
+# --- Barramento de eventos (publicador_eventos.py, consumidor_teste.py) ---
+confluent-kafka>=2.3
+
+# --- Avaliação e gráficos (comprovacaoAcertos.py, comprovacaoResultados.py) ---
 pandas
 matplotlib
 seaborn
 
-# --- Opcionais (descomente se for usar) ---
-# easyocr                   # aplicarModelo-PastaImgs.py
-# paddlepaddle
-# paddleocr
-# confluent-kafka           # integração com o barramento
+# --- Conversão do dataset (converterDataset-YOLO.py) ---
+pillow
