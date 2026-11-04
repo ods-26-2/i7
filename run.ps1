@@ -1,4 +1,4 @@
-# Equivalente do run.sh para PowerShell.
+# Equivalente do run.sh para Windows PowerShell.
 #   .\run.ps1 build                                  -> reconstrói a imagem
 #   .\run.ps1 scripts/publicador_eventos.py --exemplo -> roda um script dentro do container
 $ErrorActionPreference = "Stop"
