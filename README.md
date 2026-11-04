@@ -1,5 +1,9 @@
 # ParkFlow · I7: leitura de placas (detecção + OCR)
 
+> ## ⚠️ LEIA PRIMEIRO: [`MUDANCAS_VER5.md`](MUDANCAS_VER5.md)
+> Existe um segundo documento, curto, com o que a nossa squad **mudou em relação à arquitetura 6c** (escopo, cancela simulada, novo payload 1.1) e **como usar os arquivos**. Abra-o antes de rodar qualquer coisa.
+
+
 Componente de **reconhecimento automático de placas** para controle de acesso veicular. A câmera captura o veículo, o sistema localiza a placa, lê os caracteres, valida o formato (Mercosul ou antiga) e entrega a leitura, com a confiança, ao restante do sistema (A8) pelo evento `ods.i7.plate_read`, publicado no Kafka.
 
 ## Fluxo
