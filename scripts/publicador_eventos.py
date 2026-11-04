@@ -8,11 +8,10 @@ mensagem JSON por linha (JSONL) em um arquivo. Nenhuma conexão de rede é feita
 O publicador Kafka (modo 'kafka') tem a MESMA interface (publicar / fechar), então o restante
 do código não muda: basta trocar PUBLICACAO_MODO no .env.
 
-Campos ainda pendentes (decisão do grupo): `character_confidences` e `uncertain` são
-OBRIGATÓRIOS no contrato, mas por enquanto não são produzidos. Há duas saídas:
-    - deixar de fora (padrão): o validador os trata como opcionais;
-    - mockar (mockar_pendentes=True): preenche com valores FALSOS, só para testar o fluxo.
-      Nunca use esses valores como se fossem medições reais.
+Payload: além da placa lida, o evento leva `character_confidences` (confiança de cada um dos 7
+caracteres), `uncertain` (leitura incerta: confiança mínima abaixo do limiar) e `detection_id`
+(índice da detecção dentro do quadro; GENÉRICO por enquanto: ainda não acompanha o veículo entre
+quadros, então não identifica o mesmo veículo em quadros diferentes).
 
 Só usa a biblioteca padrão do Python.
 
@@ -35,7 +34,7 @@ from pathlib import Path
 # ocorreu); `published_at` e `captured_at` continuam no envelope como campos extras.
 # O nome do contrato é o nome do tópico (guia B2, seção 3) e vem da variável KAFKA_TOPICO.
 TOPICO_PADRAO = "ods.i7.plate_read"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"   # 1.1: payload ganhou detection_id, character_confidences e uncertain (compatível com 1.0)
 PRODUCER = "I7"
 
 CAMPOS_ENVELOPE = (  # perfil EV-SINAL
@@ -44,9 +43,10 @@ CAMPOS_ENVELOPE = (  # perfil EV-SINAL
 )
 CAMPOS_ENVELOPE_OPCIONAIS = ("correlation_id",)
 
-PAYLOAD_OBRIGATORIOS = ("frame_index", "class", "plate_layout", "license_plate", "confidence", "bbox")
-PAYLOAD_OPCIONAIS = ("detection_id",)
-PAYLOAD_PENDENTES = ("character_confidences", "uncertain")  # obrigatórios no contrato, ainda não produzidos
+PAYLOAD_OBRIGATORIOS = (
+    "frame_index", "detection_id", "class", "plate_layout", "license_plate", "confidence",
+    "character_confidences", "uncertain", "bbox",
+)
 
 CLASSES_VEICULO = ("car", "motorcycle")
 LAYOUTS = {
@@ -99,10 +99,9 @@ def _uuid_valido(v) -> bool:
 
 
 # ------------------------------ VALIDAÇÃO ---------------------------------------------
-def validar_evento(evento, exigir_pendentes: bool = False) -> list[str]:
+def validar_evento(evento) -> list[str]:
     """
     Confere o evento contra o contrato. Devolve a lista de problemas (vazia = válido).
-    `exigir_pendentes=True` torna obrigatórios character_confidences e uncertain.
     """
     if not isinstance(evento, dict):
         return ["o evento não é um objeto JSON"]
@@ -159,19 +158,17 @@ def validar_evento(evento, exigir_pendentes: bool = False) -> list[str]:
     if payload is None:
         return erros
 
-    obrigatorios = PAYLOAD_OBRIGATORIOS + (PAYLOAD_PENDENTES if exigir_pendentes else ())
-    for campo in obrigatorios:
+    for campo in PAYLOAD_OBRIGATORIOS:
         if campo not in payload:
             erros.append(f"campo obrigatório ausente no payload: {campo}")
-    permitidos = PAYLOAD_OBRIGATORIOS + PAYLOAD_OPCIONAIS + PAYLOAD_PENDENTES
     for campo in payload:
-        if campo not in permitidos:
+        if campo not in PAYLOAD_OBRIGATORIOS:
             erros.append(f"campo desconhecido no payload: {campo}")
 
     if "frame_index" in payload and not (_inteiro(payload["frame_index"]) and payload["frame_index"] >= 0):
         erros.append("frame_index deve ser um inteiro >= 0")
-    if "detection_id" in payload and not _inteiro(payload["detection_id"]):
-        erros.append("detection_id deve ser um inteiro")
+    if "detection_id" in payload and not (_inteiro(payload["detection_id"]) and payload["detection_id"] >= 0):
+        erros.append("detection_id deve ser um inteiro >= 0")
     if "class" in payload and payload["class"] not in CLASSES_VEICULO:
         erros.append(f"class deve ser um de {CLASSES_VEICULO}")
 
@@ -219,29 +216,29 @@ class ConstrutorEventos:
     ods.session.started). Enquanto o P4 não está integrado, a sessão é gerada aqui.
     """
 
-    def __init__(self, source_id: str, artifact_version: str, mockar_pendentes: bool = False):
+    def __init__(self, source_id: str, artifact_version: str):
         self.source_id = source_id
         self.artifact_version = artifact_version
-        self.mockar_pendentes = mockar_pendentes
         self.session_id = str(uuid.uuid4())
         self.sequence = 0
 
     def plate_read(self, *, placa: str, plate_layout: str, classe_veiculo: str, confianca: float,
-                   bbox, frame_index: int, captured_at: datetime | None = None) -> dict:
+                   character_confidences, uncertain: bool, bbox, frame_index: int,
+                   detection_id: int = 0, captured_at: datetime | None = None) -> dict:
         publicado = agora_utc()
         capturado = captured_at or publicado
 
         payload = {
             "frame_index": int(frame_index),
+            "detection_id": int(detection_id),   # índice da detecção no quadro (genérico por enquanto)
             "class": classe_veiculo,
             "plate_layout": plate_layout,
             "license_plate": placa,
             "confidence": round(float(confianca), 4),
+            "character_confidences": [round(float(c), 4) for c in character_confidences],
+            "uncertain": bool(uncertain),
             "bbox": [int(v) for v in bbox],
         }
-        if self.mockar_pendentes:  # VALORES FALSOS, só para exercitar o fluxo
-            payload["character_confidences"] = [payload["confidence"]] * TAMANHO_PLACA
-            payload["uncertain"] = False
 
         evento = {
             "message_type": "event",
@@ -284,9 +281,8 @@ class PublicadorArquivo:
     """Modo 'arquivo' (Fase A): valida e grava um evento JSON por linha. Sem rede."""
     ativo = True
 
-    def __init__(self, caminho, exigir_pendentes: bool = False):
+    def __init__(self, caminho):
         self.caminho = Path(caminho)
-        self.exigir_pendentes = exigir_pendentes
         self.publicados = 0
         self.descartados = 0
         self._arquivo = None
@@ -302,7 +298,7 @@ class PublicadorArquivo:
 
     def publicar(self, evento) -> bool:
         """Grava o evento se for válido. Devolve True se gravou, False se descartou."""
-        erros = validar_evento(evento, self.exigir_pendentes)
+        erros = validar_evento(evento)
         if erros:
             self.descartados += 1
             print(f"[PUBLICAÇÃO] evento descartado: {'; '.join(erros[:3])}")
@@ -348,8 +344,7 @@ class PublicadorKafka:
     """
     ativo = True
 
-    def __init__(self, exigir_pendentes: bool = False):
-        self.exigir_pendentes = exigir_pendentes
+    def __init__(self):
         self.topico = topico()
         self.broker = broker()
         self.enviados = 0       # entregues ao broker (confirmação recebida)
@@ -388,7 +383,7 @@ class PublicadorKafka:
 
     def publicar(self, evento) -> bool:
         """Valida e enfileira o envio. Devolve True se enfileirou (a entrega é confirmada depois)."""
-        erros = validar_evento(evento, self.exigir_pendentes)
+        erros = validar_evento(evento)
         if erros:
             self.descartados += 1
             print(f"[PUBLICAÇÃO] evento descartado: {'; '.join(erros[:3])}")
@@ -423,19 +418,19 @@ class PublicadorKafka:
                 + (f", {self.descartados} descartado(s) por violar o contrato" if self.descartados else ""))
 
 
-def criar_publicador(modo: str, caminho_arquivo, exigir_pendentes: bool = False):
+def criar_publicador(modo: str, caminho_arquivo):
     modo = (modo or "").strip().lower()
     if modo == "desligado":
         return PublicadorNulo()
     if modo == "arquivo":
-        return PublicadorArquivo(caminho_arquivo, exigir_pendentes)
+        return PublicadorArquivo(caminho_arquivo)
     if modo == "kafka":
-        return PublicadorKafka(exigir_pendentes)
+        return PublicadorKafka()
     raise ValueError(f"PUBLICACAO_MODO inválido: '{modo}'. Use 'arquivo', 'kafka' ou 'desligado'.")
 
 
 # ------------------------------ LINHA DE COMANDO --------------------------------------
-def _validar_arquivo(caminho, exigir_pendentes: bool) -> int:
+def _validar_arquivo(caminho) -> int:
     caminho = Path(caminho)
     if not caminho.is_file():
         print(f"[ERRO] Arquivo não encontrado: {caminho}")
@@ -451,7 +446,7 @@ def _validar_arquivo(caminho, exigir_pendentes: bool) -> int:
             except json.JSONDecodeError as e:
                 erros = [f"JSON inválido ({e.msg})"]
             else:
-                erros = validar_evento(evento, exigir_pendentes)
+                erros = validar_evento(evento)
             if erros:
                 invalidos += 1
                 print(f"linha {n}: " + "; ".join(erros))
@@ -494,21 +489,21 @@ def _main():
     grupo.add_argument("--validar", metavar="ARQUIVO", help="valida um arquivo JSONL de eventos")
     grupo.add_argument("--criar-topico", action="store_true",
                        help="cria o tópico KAFKA_TOPICO no broker KAFKA_BROKER (se não existir)")
-    parser.add_argument("--exigir-pendentes", action="store_true",
-                        help="trata character_confidences e uncertain como obrigatórios")
     args = parser.parse_args()
 
     if args.criar_topico:
         return _criar_topico()
     if args.exemplo:
-        c = ConstrutorEventos("cam-entrada", "exemplo-0.0.0", mockar_pendentes=args.exigir_pendentes)
+        c = ConstrutorEventos("cam-entrada", "exemplo-0.0.0")
+        confs = [0.99, 0.98, 0.97, 0.95, 0.94, 0.96, 0.98]
         evento = c.plate_read(placa="BRA2E19", plate_layout="MERCOSUL", classe_veiculo="car",
-                              confianca=0.94, bbox=[1020, 640, 1190, 700], frame_index=0)
+                              confianca=min(confs), character_confidences=confs, uncertain=False,
+                              bbox=[1020, 640, 1190, 700], frame_index=0, detection_id=0)
         print(json.dumps(evento, ensure_ascii=False, indent=2))
-        erros = validar_evento(evento, args.exigir_pendentes)
+        erros = validar_evento(evento)
         print("\nVálido." if not erros else "\nProblemas: " + "; ".join(erros))
         return 0 if not erros else 1
-    return _validar_arquivo(args.validar, args.exigir_pendentes)
+    return _validar_arquivo(args.validar)
 
 
 if __name__ == "__main__":
