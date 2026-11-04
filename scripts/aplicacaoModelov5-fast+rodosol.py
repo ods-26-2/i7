@@ -21,6 +21,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -64,11 +65,15 @@ MARGEM_RECORTE_PCT = env_numero("MARGEM_RECORTE_PCT", 0)    # % da caixa somada 
 # Margem só para as classes Mercosul (..._ME). Se vazia, todas as classes usam MARGEM_RECORTE_PCT.
 MARGEM_RECORTE_MERCOSUL_PCT = (env_numero("MARGEM_RECORTE_MERCOSUL_PCT", 0)
                                if os.getenv("MARGEM_RECORTE_MERCOSUL_PCT", "").strip() else None)
-DOBRAR_2L = os.getenv("DOBRAR_2L", "nao").strip().lower()    # nao | auto | fixo (placas de 2 linhas)
+DOBRAR_2L = os.getenv("DOBRAR_2L", "nao").strip().lower()    # nao | auto | fixo | separar (placas de 2 linhas)
 DOBRAR_DIVISAO_PCT = env_numero("DOBRAR_DIVISAO_PCT", 55)   # altura (%) onde termina a 1ª linha
 DOBRAR_FOLGA_PCT = env_numero("DOBRAR_FOLGA_PCT", 0)         # % da altura que a 2ª linha "sobe" além do corte
 DOBRAR_DESCARTE_TOPO_PCT = env_numero("DOBRAR_DESCARTE_TOPO_PCT", 0)  # % da altura descartada no TOPO (faixa BRASIL)
 OCR_MODELO = os.getenv("OCR_MODELO", "global-plates-mobile-vit-v2-model")  # modelo do hub do Fast-ALPR
+# Ampliação e nitidez do recorte antes do OCR (0 = comportamento original)
+PRE_ALTURA_ALVO = env_numero("PRE_ALTURA_ALVO", 0)   # >0: amplia o recorte até esta altura (px), sem reduzir
+PRE_NITIDEZ = env_numero("PRE_NITIDEZ", 0)           # >0: realce de nitidez (unsharp mask) após o filtro
+PRE_PROPORCAO = env_numero("PRE_PROPORCAO", 0)       # >0: recortes mais "quadrados" que isso (largura/altura) ganham bordas laterais
 
 # --- Publicação de eventos (barramento) ---
 PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo", "kafka" ou "desligado"
@@ -127,8 +132,23 @@ def pre_processar_recorte_ocr(crop: np.ndarray) -> np.ndarray:
 
     # 2. Redimensionar se o recorte for muito pequeno (aumenta definição das letras)
     h, w = gray.shape
-    if h < 80 or w < 240:
+    if PRE_ALTURA_ALVO > 0:
+        # ampliação até a altura alvo, mantendo a proporção (nunca reduz)
+        if h < PRE_ALTURA_ALVO:
+            fator = PRE_ALTURA_ALVO / h
+            gray = cv2.resize(gray, (max(1, round(w * fator)), round(PRE_ALTURA_ALVO)),
+                              interpolation=cv2.INTER_CUBIC)
+    elif h < 80 or w < 240:
         gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+    # 2b. (opcional) Proporção: completa as laterais com a borda da própria imagem até largura/altura = PRE_PROPORCAO,
+    # em vez de deixar o OCR esticar o recorte na horizontal (as letras ficariam deformadas)
+    if PRE_PROPORCAO > 0:
+        h, w = gray.shape
+        largura_alvo = int(round(h * PRE_PROPORCAO))
+        if w < largura_alvo:
+            esq = (largura_alvo - w) // 2
+            gray = cv2.copyMakeBorder(gray, 0, 0, esq, largura_alvo - w - esq, cv2.BORDER_REPLICATE)
 
     # 3. CLAHE (Contrast Limited Adaptive Histogram Equalization) para realçar letras
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -136,6 +156,11 @@ def pre_processar_recorte_ocr(crop: np.ndarray) -> np.ndarray:
 
     # 4. Filtro Bilateral para suavizar ruído sem borrar os contornos dos caracteres
     filtrado = cv2.bilateralFilter(equalizado, d=5, sigmaColor=75, sigmaSpace=75)
+
+    # 5. (opcional) Realce de nitidez: unsharp mask, força PRE_NITIDEZ
+    if PRE_NITIDEZ > 0:
+        borrado = cv2.GaussianBlur(filtrado, (0, 0), 1.5)
+        filtrado = cv2.addWeighted(filtrado, 1.0 + PRE_NITIDEZ, borrado, -PRE_NITIDEZ, 0)
 
     # Reverte para 3 canais BGR pois o modelo de OCR espera imagem com 3 canais
     return cv2.cvtColor(filtrado, cv2.COLOR_GRAY2BGR)
@@ -299,6 +324,43 @@ def encontrar_divisao_linhas(crop_bgr: np.ndarray, divisao_padrao_pct: float) ->
     return ini + int(np.median(fundo))
 
 
+def cortar_linhas_placa(crop_bgr: np.ndarray, modo: str, divisao_pct: float,
+                        folga_pct: float = 0.0, descarte_topo_pct: float = 0.0):
+    """
+    Separa a placa de 2 linhas em (linha de cima, linha de baixo). Devolve None se o recorte for
+    pequeno demais. `modo` "auto" acha o corte pelo vale entre as linhas; "fixo" usa `divisao_pct`.
+    """
+    h = crop_bgr.shape[0]
+    if h < 4:
+        return None
+    if modo == "auto":
+        corte = encontrar_divisao_linhas(crop_bgr, divisao_pct)
+    else:
+        corte = int(round(h * divisao_pct / 100.0))
+    corte = min(max(corte, 2), h - 2)
+    inicio_base = max(0, corte - int(round(h * folga_pct / 100.0)))
+    inicio_topo = min(int(round(h * descarte_topo_pct / 100.0)), max(0, corte - 2))
+    return crop_bgr[inicio_topo:corte], crop_bgr[inicio_base:]
+
+
+def ler_placa_2_linhas(ocr, linhas, preprocessar):
+    """
+    Lê cada linha da placa SEPARADAMENTE (cada uma ocupa a imagem inteira, como numa placa de 1 linha)
+    e junta os resultados: texto de cima + texto de baixo, com as confianças na mesma ordem.
+    Devolve um objeto com `.text` e `.confidence` (como o resultado do OCR), ou None se alguma
+    das linhas não for lida ou não trouxer a confiança por caractere.
+    """
+    textos, confs = [], []
+    for linha in linhas:
+        resultado = ocr.predict(preprocessar(linha))
+        if not resultado or not isinstance(resultado.confidence, (list, tuple)) \
+                or len(resultado.confidence) < len(resultado.text):
+            return None
+        textos.append(resultado.text)
+        confs.extend(float(c) for c in resultado.confidence[:len(resultado.text)])
+    return SimpleNamespace(text="".join(textos), confidence=confs)
+
+
 def dobrar_placa_2_linhas(crop_bgr: np.ndarray, modo: str, divisao_pct: float,
                           folga_pct: float = 0.0, descarte_topo_pct: float = 0.0) -> np.ndarray:
     """
@@ -312,17 +374,10 @@ def dobrar_placa_2_linhas(crop_bgr: np.ndarray, modo: str, divisao_pct: float,
     Mercosul, ou a tarja da cidade nas antigas), que não tem caracteres úteis e faz as letras da
     1ª linha ficarem menores que os dígitos da 2ª depois de igualar as alturas.
     """
-    h = crop_bgr.shape[0]
-    if h < 4:
+    linhas = cortar_linhas_placa(crop_bgr, modo, divisao_pct, folga_pct, descarte_topo_pct)
+    if linhas is None:
         return crop_bgr
-    if modo == "auto":
-        corte = encontrar_divisao_linhas(crop_bgr, divisao_pct)
-    else:
-        corte = int(round(h * divisao_pct / 100.0))
-    corte = min(max(corte, 2), h - 2)
-    inicio_base = max(0, corte - int(round(h * folga_pct / 100.0)))
-    inicio_topo = min(int(round(h * descarte_topo_pct / 100.0)), max(0, corte - 2))
-    topo, base = crop_bgr[inicio_topo:corte], crop_bgr[inicio_base:]
+    topo, base = linhas
     altura = max(topo.shape[0], base.shape[0])
 
     def ajustar(parte):
@@ -334,8 +389,8 @@ def dobrar_placa_2_linhas(crop_bgr: np.ndarray, modo: str, divisao_pct: float,
 
 def validar_config_experimento() -> list[str]:
     erros = []
-    if DOBRAR_2L not in ("nao", "auto", "fixo"):
-        erros.append(f"DOBRAR_2L deve ser 'nao', 'auto' ou 'fixo' (recebi '{DOBRAR_2L}')")
+    if DOBRAR_2L not in ("nao", "auto", "fixo", "separar"):
+        erros.append(f"DOBRAR_2L deve ser 'nao', 'auto', 'fixo' ou 'separar' (recebi '{DOBRAR_2L}')")
     if not 0 <= MARGEM_RECORTE_PCT <= 50:
         erros.append(f"MARGEM_RECORTE_PCT deve estar entre 0 e 50 (recebi {MARGEM_RECORTE_PCT})")
     if MARGEM_RECORTE_MERCOSUL_PCT is not None and not 0 <= MARGEM_RECORTE_MERCOSUL_PCT <= 50:
@@ -346,6 +401,12 @@ def validar_config_experimento() -> list[str]:
         erros.append(f"DOBRAR_FOLGA_PCT deve estar entre 0 e 20 (recebi {DOBRAR_FOLGA_PCT})")
     if not 0 <= DOBRAR_DESCARTE_TOPO_PCT <= 40:
         erros.append(f"DOBRAR_DESCARTE_TOPO_PCT deve estar entre 0 e 40 (recebi {DOBRAR_DESCARTE_TOPO_PCT})")
+    if PRE_ALTURA_ALVO != 0 and not 32 <= PRE_ALTURA_ALVO <= 400:
+        erros.append(f"PRE_ALTURA_ALVO deve ser 0 (desligado) ou estar entre 32 e 400 (recebi {PRE_ALTURA_ALVO})")
+    if PRE_PROPORCAO != 0 and not 1 <= PRE_PROPORCAO <= 4:
+        erros.append(f"PRE_PROPORCAO deve ser 0 (desligado) ou estar entre 1 e 4 (recebi {PRE_PROPORCAO})")
+    if not 0 <= PRE_NITIDEZ <= 3:
+        erros.append(f"PRE_NITIDEZ deve estar entre 0 e 3 (recebi {PRE_NITIDEZ})")
     if not OCR_MODELO.strip():
         erros.append("OCR_MODELO está vazio")
     return erros
@@ -367,6 +428,9 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "dobrar_folga_pct": DOBRAR_FOLGA_PCT,
         "dobrar_descarte_topo_pct": DOBRAR_DESCARTE_TOPO_PCT,
         "ocr_modelo": OCR_MODELO,
+        "pre_altura_alvo": PRE_ALTURA_ALVO,
+        "pre_nitidez": PRE_NITIDEZ,
+        "pre_proporcao": PRE_PROPORCAO,
     }
 
 
@@ -532,15 +596,24 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
 
                 # Experimento: placa de 2 linhas "dobrada" em uma linha larga
                 entrada_ocr = crop_original
+                linhas_2l = None
                 if DOBRAR_2L != "nao" and nome_classe_raw.startswith("placa_2L"):
-                    entrada_ocr = dobrar_placa_2_linhas(crop_original, DOBRAR_2L, DOBRAR_DIVISAO_PCT,
+                    if DOBRAR_2L == "separar":
+                        # lê cada linha sozinha (corte automático pelo vale entre as linhas)
+                        linhas_2l = cortar_linhas_placa(crop_original, "auto", DOBRAR_DIVISAO_PCT,
                                                         DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
+                    # no mosaico: a placa "dobrada" (no modo separar, só para ver onde foi o corte)
+                    entrada_ocr = dobrar_placa_2_linhas(crop_original, "auto" if DOBRAR_2L == "separar" else DOBRAR_2L,
+                                                        DOBRAR_DIVISAO_PCT, DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
 
                 # Pré-processamento antes da chamada do OCR (pode ser desligado: PREPROCESSAMENTO=nao)
-                crop_processado = pre_processar_recorte_ocr(entrada_ocr) if PREPROCESSAMENTO else entrada_ocr
+                preprocessar = pre_processar_recorte_ocr if PREPROCESSAMENTO else (lambda im: im)
 
-                # OCR no recorte pré-processado
-                ocr_result = ocr.predict(crop_processado)
+                # OCR: uma imagem só (padrão, dobrada ou não) ou cada linha separadamente
+                if linhas_2l is not None:
+                    ocr_result = ler_placa_2_linhas(ocr, linhas_2l, preprocessar)
+                else:
+                    ocr_result = ocr.predict(preprocessar(entrada_ocr))
 
                 texto_ocr = ""
                 conf_ocr = 0.0
@@ -629,7 +702,9 @@ def main(limite: int | None = None):
     construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION)
 
     print(f"Detector: YOLO Próprio | OCR: Fast-ALPR ({OCR_MODELO}) | {len(pastas)} pasta(s) de imagens")
-    print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'} | "
+    print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
+          + (f" (altura alvo {PRE_ALTURA_ALVO:g}px, nitidez {PRE_NITIDEZ:g}, proporção {PRE_PROPORCAO:g})"
+             if PRE_ALTURA_ALVO or PRE_NITIDEZ or PRE_PROPORCAO else "") + " | "
           f"margem={MARGEM_RECORTE_PCT:g}%"
           + (f" (Mercosul: {MARGEM_RECORTE_MERCOSUL_PCT:g}%)" if MARGEM_RECORTE_MERCOSUL_PCT is not None else "")
           + f" | dobrar_2l={DOBRAR_2L}"

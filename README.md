@@ -100,7 +100,7 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
 | `KAFKA_BROKER` | `34.66.235.91:9093` | idem (temporário) | Endereço do broker; na versão final será local |
 
-Experimentais (sem ganho nos testes, ficam desligados): `DOBRAR_2L` (`nao`/`auto`/`fixo`), `DOBRAR_DIVISAO_PCT`, `DOBRAR_FOLGA_PCT`, `DOBRAR_DESCARTE_TOPO_PCT`.
+Experimentais (sem ganho nos testes, ficam desligados): `DOBRAR_2L` (`nao`/`auto`/`fixo`/`separar`; `separar` lê cada linha da placa de moto sozinha e junta o resultado, ainda em avaliação), `DOBRAR_DIVISAO_PCT`, `DOBRAR_FOLGA_PCT`, `DOBRAR_DESCARTE_TOPO_PCT`. Pré-processamento do recorte: `PRE_ALTURA_ALVO=160` (amplia o recorte até essa altura em pixels) e `PRE_PROPORCAO=2` (completa as laterais do recorte até uma proporção largura/altura, em vez de esticar) estão recomendados no `.env.example`: nas 400 motos subiram de 71,8% para 75,5% de placas corretas e os carros ficaram iguais. `PRE_NITIDEZ` (realce de nitidez) piorou nos testes e fica em 0. Com 0 em todos, vale o comportamento original.
 
 ## Como usar
 
