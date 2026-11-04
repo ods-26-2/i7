@@ -1,0 +1,5 @@
+datasetConvertidoYOLO/
+.env
+saidas/
+.venv/
+scripts/__pycache__
