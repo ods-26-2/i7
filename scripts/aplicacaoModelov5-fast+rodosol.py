@@ -70,7 +70,7 @@ DOBRAR_DESCARTE_TOPO_PCT = env_numero("DOBRAR_DESCARTE_TOPO_PCT", 0)  # % da alt
 OCR_MODELO = os.getenv("OCR_MODELO", "global-plates-mobile-vit-v2-model")  # modelo do hub do Fast-ALPR
 
 # --- Publicação de eventos (barramento) ---
-PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo" ou "desligado" (kafka: Fase B)
+PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo", "kafka" ou "desligado"
 PUBLICACAO_MOCKAR_PENDENTES = os.getenv("PUBLICACAO_MOCKAR_PENDENTES", "nao").strip().lower() in (
     "1", "true", "sim", "s", "yes")   # True: preenche character_confidences/uncertain com valores FALSOS
 SOURCE_ID = os.getenv("SOURCE_ID", "cam-entrada")           # câmera/portão de origem
@@ -530,7 +530,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
                     layout_placa, classe_veiculo = CLASSES_PARA_CONTRATO[nome_classe_raw]
                     publicador.publicar(construtor.plate_read(
                         placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
-                        confianca=conf_ocr,  # média das confianças por caractere (ver média x mínimo)
+                        confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
                         bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=i - 1,
                         captured_at=capturado_em))
 

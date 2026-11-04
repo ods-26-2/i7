@@ -1,12 +1,12 @@
 """
-Publicador de eventos do I7 (Fase A: sem rede).
+Publicador de eventos do I7 (modos: arquivo, kafka, desligado).
 
 Monta o evento `ods.i7.plate_read` exatamente como a Arquitetura 6c descreve (envelope comum
 de perfil EV-SINAL + payload), valida o resultado contra o contrato e o "publica" gravando uma
 mensagem JSON por linha (JSONL) em um arquivo. Nenhuma conexão de rede é feita.
 
-A Fase B acrescentará um publicador Kafka com a MESMA interface (publicar / fechar), então o
-restante do código não precisará mudar: basta trocar o modo em `criar_publicador`.
+O publicador Kafka (modo 'kafka') tem a MESMA interface (publicar / fechar), então o restante
+do código não muda: basta trocar PUBLICACAO_MODO no .env.
 
 Campos ainda pendentes (decisão do grupo): `character_confidences` e `uncertain` são
 OBRIGATÓRIOS no contrato, mas por enquanto não são produzidos. Há duas saídas:
@@ -21,23 +21,26 @@ Uso rápido (sem rodar nenhum modelo):
     python publicador_eventos.py --validar eventos.jsonl   # valida um arquivo JSONL existente
 """
 import argparse
+import atexit
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ============================ CONTRATO (Arquitetura 6c) ============================
-# Os nomes abaixo seguem a Arquitetura 6c. O guia do Kafka mostra um exemplo simplificado
-# com `occurred_at`; a arquitetura usa `published_at` + `captured_at`. Se o TRA-1 mandar
-# mudar, é só ajustar aqui e em CAMPOS_ENVELOPE.
-SCHEMA = "ods.i7.plate_read"          # nome do contrato = nome do tópico
+# Os nomes abaixo seguem a Arquitetura 6c, mais `occurred_at`, que o guia do Kafka (B2) exige
+# de todo consumidor. `occurred_at` recebe o mesmo valor de `captured_at` (quando o fato
+# ocorreu); `published_at` e `captured_at` continuam no envelope como campos extras.
+# O nome do contrato é o nome do tópico (guia B2, seção 3) e vem da variável KAFKA_TOPICO.
+TOPICO_PADRAO = "ods.i7.plate_read"
 SCHEMA_VERSION = "1.0"
 PRODUCER = "I7"
 
 CAMPOS_ENVELOPE = (  # perfil EV-SINAL
-    "message_type", "message_id", "schema", "schema_version", "producer", "published_at",
-    "captured_at", "source_id", "session_id", "sequence", "artifact_version", "payload",
+    "message_type", "message_id", "schema", "schema_version", "producer", "occurred_at",
+    "published_at", "captured_at", "source_id", "session_id", "sequence", "artifact_version", "payload",
 )
 CAMPOS_ENVELOPE_OPCIONAIS = ("correlation_id",)
 
@@ -55,6 +58,12 @@ TAMANHO_PLACA = 7
 
 
 # ------------------------------ UTILITÁRIOS ------------------------------------------
+def topico() -> str:
+    """Nome do tópico = valor do campo `schema`. Lido na hora do uso (e não ao importar),
+    porque o .env só é carregado depois que este módulo é importado."""
+    return os.environ.get("KAFKA_TOPICO", "").strip() or TOPICO_PADRAO
+
+
 def agora_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -113,8 +122,8 @@ def validar_evento(evento, exigir_pendentes: bool = False) -> list[str]:
         erros.append("message_id não é um UUID válido")
     if "session_id" in evento and not _uuid_valido(evento["session_id"]):
         erros.append("session_id não é um UUID válido")
-    if "schema" in evento and evento["schema"] != SCHEMA:
-        erros.append(f"schema deve ser '{SCHEMA}'")
+    if "schema" in evento and evento["schema"] != topico():
+        erros.append(f"schema deve ser '{topico()}'")
     if "schema_version" in evento and not re.fullmatch(r"\d+\.\d+", str(evento["schema_version"])):
         erros.append("schema_version deve ter o formato MAJOR.MINOR")
     if "producer" in evento and evento["producer"] != PRODUCER:
@@ -125,18 +134,22 @@ def validar_evento(evento, exigir_pendentes: bool = False) -> list[str]:
     if "sequence" in evento and not (_inteiro(evento["sequence"]) and evento["sequence"] >= 0):
         erros.append("sequence deve ser um inteiro >= 0")
 
-    pub = cap = None
-    for campo in ("published_at", "captured_at"):
+    pub = cap = occ = None
+    for campo in ("occurred_at", "published_at", "captured_at"):
         if campo in evento:
             dt = ler_instante(evento[campo])
             if dt is None:
                 erros.append(f"{campo} deve ser ISO 8601 em UTC terminando em 'Z'")
             elif campo == "published_at":
                 pub = dt
-            else:
+            elif campo == "captured_at":
                 cap = dt
+            else:
+                occ = dt
     if pub and cap and cap > pub:
         erros.append("captured_at não pode ser depois de published_at")
+    if occ and cap and occ != cap:
+        erros.append("occurred_at deve ser igual a captured_at")
 
     # --- payload ---
     payload = evento.get("payload")
@@ -233,9 +246,10 @@ class ConstrutorEventos:
         evento = {
             "message_type": "event",
             "message_id": str(uuid.uuid4()),
-            "schema": SCHEMA,
+            "schema": topico(),
             "schema_version": SCHEMA_VERSION,
             "producer": PRODUCER,
+            "occurred_at": formatar_instante(capturado),
             "published_at": formatar_instante(publicado),
             "captured_at": formatar_instante(capturado),
             "source_id": self.source_id,
@@ -306,6 +320,109 @@ class PublicadorArquivo:
                 + (f", {self.descartados} descartado(s) por violar o contrato" if self.descartados else ""))
 
 
+def broker() -> str:
+    """Endereço do broker (guia B2: configurável, nunca fixo no código)."""
+    return os.environ.get("KAFKA_BROKER", "").strip() or "34.66.235.91:9093"
+
+
+_PRODUCER = None   # um único produtor por execução: evita reconectar ao broker a cada pasta
+
+
+def _flush_final():
+    if _PRODUCER is not None:
+        _PRODUCER.flush(20)
+
+
+atexit.register(_flush_final)
+
+
+class PublicadorKafka:
+    """
+    Modo 'kafka' (Fase B): valida cada evento e o envia ao tópico `topico()` do broker `broker()`.
+    Mesma interface do PublicadorArquivo (publicar / fechar / resumo), então o restante do
+    código não muda.
+
+    Cuidados com o broker compartilhado (guia B2, seção 4.5): sem laços de repetição, sem
+    reconexões infinitas (message.timeout.ms limita o tempo de cada envio) e flush() ao fechar.
+    A chave da mensagem é o source_id, para manter a ordem dos eventos de uma mesma câmera.
+    """
+    ativo = True
+
+    def __init__(self, exigir_pendentes: bool = False):
+        self.exigir_pendentes = exigir_pendentes
+        self.topico = topico()
+        self.broker = broker()
+        self.enviados = 0       # entregues ao broker (confirmação recebida)
+        self.falhas = 0         # o broker não confirmou
+        self.descartados = 0    # violaram o contrato, nem foram enviados
+        self._producer = None
+
+    def __enter__(self):
+        try:
+            from confluent_kafka import Producer
+        except ImportError:
+            raise SystemExit("[ERRO] Modo 'kafka' exige: pip install confluent-kafka")
+        global _PRODUCER
+        if _PRODUCER is None:
+            _PRODUCER = Producer({
+                "bootstrap.servers": self.broker,
+                "client.id": "i7-publicador",
+                "acks": "all",
+                "enable.idempotence": True,        # reenvios internos não duplicam mensagens
+                "message.timeout.ms": 15000,       # desiste de uma mensagem após 15 s
+            })
+        self._producer = _PRODUCER
+        return self
+
+    def __exit__(self, *args):
+        self.fechar()
+        return False
+
+    def _confirmacao(self, erro, _msg):
+        if erro is None:
+            self.enviados += 1
+        else:
+            self.falhas += 1
+            if self.falhas <= 3:  # evita inundar o terminal
+                print(f"[PUBLICAÇÃO] falha ao entregar ao Kafka: {erro}")
+
+    def publicar(self, evento) -> bool:
+        """Valida e enfileira o envio. Devolve True se enfileirou (a entrega é confirmada depois)."""
+        erros = validar_evento(evento, self.exigir_pendentes)
+        if erros:
+            self.descartados += 1
+            print(f"[PUBLICAÇÃO] evento descartado: {'; '.join(erros[:3])}")
+            return False
+        dados = json.dumps(evento, ensure_ascii=False).encode("utf-8")
+        chave = evento["source_id"].encode("utf-8")
+        try:
+            self._producer.produce(self.topico, value=dados, key=chave, on_delivery=self._confirmacao)
+        except BufferError:   # fila interna cheia: espera um pouco UMA vez e tenta de novo
+            self._producer.poll(1.0)
+            try:
+                self._producer.produce(self.topico, value=dados, key=chave, on_delivery=self._confirmacao)
+            except BufferError:
+                self.falhas += 1
+                return False
+        self._producer.poll(0)   # atende as confirmações já recebidas
+        return True
+
+    def fechar(self):
+        if self._producer is not None:
+            # Espera até 20 s pelas confirmações. O produtor continua aberto para a próxima
+            # pasta; ele é esvaziado de novo e encerrado ao fim do programa (atexit).
+            restantes = self._producer.flush(20)
+            if restantes:
+                self.falhas += restantes
+                print(f"[PUBLICAÇÃO] {restantes} mensagem(ns) sem confirmação do broker")
+            self._producer = None
+
+    def resumo(self) -> str:
+        return (f"{self.enviados} evento(s) entregue(s) ao tópico {self.topico} ({self.broker})"
+                + (f", {self.falhas} falha(s) de entrega" if self.falhas else "")
+                + (f", {self.descartados} descartado(s) por violar o contrato" if self.descartados else ""))
+
+
 def criar_publicador(modo: str, caminho_arquivo, exigir_pendentes: bool = False):
     modo = (modo or "").strip().lower()
     if modo == "desligado":
@@ -313,8 +430,8 @@ def criar_publicador(modo: str, caminho_arquivo, exigir_pendentes: bool = False)
     if modo == "arquivo":
         return PublicadorArquivo(caminho_arquivo, exigir_pendentes)
     if modo == "kafka":
-        raise NotImplementedError("O modo 'kafka' será implementado na Fase B. Use 'arquivo' ou 'desligado'.")
-    raise ValueError(f"PUBLICACAO_MODO inválido: '{modo}'. Use 'arquivo' ou 'desligado'.")
+        return PublicadorKafka(exigir_pendentes)
+    raise ValueError(f"PUBLICACAO_MODO inválido: '{modo}'. Use 'arquivo', 'kafka' ou 'desligado'.")
 
 
 # ------------------------------ LINHA DE COMANDO --------------------------------------
@@ -342,15 +459,47 @@ def _validar_arquivo(caminho, exigir_pendentes: bool) -> int:
     return 1 if invalidos else 0
 
 
+def _criar_topico() -> int:
+    """Cria o tópico no broker se ele ainda não existir. Uma consulta + uma criação, sem loop."""
+    try:
+        from confluent_kafka.admin import AdminClient, NewTopic
+    except ImportError:
+        print("[ERRO] Instale a biblioteca: pip install confluent-kafka")
+        return 2
+    nome = topico()
+    admin = AdminClient({"bootstrap.servers": broker()})
+    if nome in admin.list_topics(timeout=10).topics:
+        print(f"O tópico '{nome}' já existe em {broker()}. Nada a fazer.")
+        return 0
+    # 1 partição: preserva a ordem dos eventos (campo sequence). O cluster tem 1 broker.
+    futuros = admin.create_topics([NewTopic(nome, num_partitions=1, replication_factor=1)])
+    try:
+        futuros[nome].result(timeout=15)
+    except Exception as e:  # o motivo (permissão, política do broker...) vem na mensagem
+        print(f"[ERRO] Não foi possível criar '{nome}': {e}")
+        return 1
+    print(f"Tópico '{nome}' criado em {broker()}.")
+    return 0
+
+
 def _main():
+    try:  # lê o .env da raiz do projeto, se python-dotenv estiver instalado
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    except ImportError:
+        pass
     parser = argparse.ArgumentParser(description="Utilitários do publicador de eventos do I7.")
     grupo = parser.add_mutually_exclusive_group(required=True)
     grupo.add_argument("--exemplo", action="store_true", help="imprime um evento de exemplo e o valida")
     grupo.add_argument("--validar", metavar="ARQUIVO", help="valida um arquivo JSONL de eventos")
+    grupo.add_argument("--criar-topico", action="store_true",
+                       help="cria o tópico KAFKA_TOPICO no broker KAFKA_BROKER (se não existir)")
     parser.add_argument("--exigir-pendentes", action="store_true",
                         help="trata character_confidences e uncertain como obrigatórios")
     args = parser.parse_args()
 
+    if args.criar_topico:
+        return _criar_topico()
     if args.exemplo:
         c = ConstrutorEventos("cam-entrada", "exemplo-0.0.0", mockar_pendentes=args.exigir_pendentes)
         evento = c.plate_read(placa="BRA2E19", plate_layout="MERCOSUL", classe_veiculo="car",
