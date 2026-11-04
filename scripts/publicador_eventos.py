@@ -34,7 +34,7 @@ from pathlib import Path
 # ocorreu); `published_at` e `captured_at` continuam no envelope como campos extras.
 # O nome do contrato é o nome do tópico (guia B2, seção 3) e vem da variável KAFKA_TOPICO.
 TOPICO_PADRAO = "ods.i7.plate_read"
-SCHEMA_VERSION = "1.1"   # 1.1: payload ganhou detection_id, character_confidences e uncertain (compatível com 1.0)
+SCHEMA_VERSION = "1.0"   # versão do contrato da Especificação de interfaces 1.0 (arquitetura 6c)
 PRODUCER = "I7"
 
 CAMPOS_ENVELOPE = (  # perfil EV-SINAL

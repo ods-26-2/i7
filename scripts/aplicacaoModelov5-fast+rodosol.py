@@ -6,8 +6,9 @@ Pipeline ALPR Personalizado:
 4. OCR especializado via Fast-ALPR (DefaultOCR)
 5. Aplicação rígida de máscara posicional e validação por Regex
 6. Geração de mosaicos e exportação CSV
-7. Geração dos eventos ods.i7.plate_read (um por leitura aceita) em eventos.jsonl
-   (Fase A do barramento: valida o contrato e grava em arquivo, sem rede)
+7. Geração dos eventos ods.i7.plate_read (um por leitura aceita), validados contra o contrato.
+   PUBLICACAO_MODO: "arquivo" grava eventos.jsonl (sem rede), "kafka" envia ao broker e
+   "desligado" não gera eventos.
 8. Experimentos de OCR controlados pelo .env (todos neutros por padrão): PREPROCESSAMENTO,
    MARGEM_RECORTE_PCT, DOBRAR_2L, DOBRAR_DIVISAO_PCT, OCR_MODELO. Cada execução grava um
    experimento.json com a configuração usada, e o resultados.csv inclui o texto BRUTO do OCR.
@@ -71,8 +72,8 @@ OCR_MODELO = os.getenv("OCR_MODELO", "global-plates-mobile-vit-v2-model")  # mod
 
 # --- Publicação de eventos (barramento) ---
 PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo", "kafka" ou "desligado"
-# `uncertain` no evento = confiança mínima por caractere abaixo deste limiar (o a8 usa o mesmo valor
-# como mínimo para liberar a entrada: abaixo dele a leitura não abre a cancela sozinha)
+# `uncertain` no evento = confiança mínima por caractere abaixo deste limiar.
+# É independente do mínimo que o A8 usa para liberar a entrada (variável própria do A8); hoje os dois valem 0,9.
 LIMIAR_INCERTEZA = env_numero("LIMIAR_INCERTEZA", 0.9)
 SOURCE_ID = os.getenv("SOURCE_ID", "cam-entrada")           # câmera/portão de origem
 ARTIFACT_VERSION = os.getenv("ARTIFACT_VERSION") or (

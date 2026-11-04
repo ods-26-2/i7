@@ -1,7 +1,7 @@
 # ParkFlow · I7: leitura de placas (detecção + OCR)
 
 > ## ⚠️ LEIA PRIMEIRO: [`MUDANCAS_VER5.md`](MUDANCAS_VER5.md)
-> Existe um segundo documento, curto, com o que a nossa squad **mudou em relação à arquitetura 6c** (escopo, cancela simulada, novo payload 1.1) e **como usar os arquivos**. Abra-o antes de rodar qualquer coisa.
+> Existe um segundo documento, curto, com o que a nossa squad **mudou em relação à arquitetura 6c** (escopo, cancela simulada, diferenças no payload do I7) e **como usar os arquivos**. Abra-o antes de rodar qualquer coisa.
 
 
 Componente de **reconhecimento automático de placas** para controle de acesso veicular. A câmera captura o veículo, o sistema localiza a placa, lê os caracteres, valida o formato (Mercosul ou antiga) e entrega a leitura, com a confiança, ao restante do sistema (A8) pelo evento `ods.i7.plate_read`, publicado no Kafka.
@@ -121,7 +121,7 @@ Para comparar configurações, rode o pipeline uma vez para cada uma, cada qual 
 
 Cada leitura **aceita pela validação de formato** vira um evento `ods.i7.plate_read`. Leituras recusadas não geram evento.
 
-**Envelope** (guia do Kafka B2 + Arquitetura 6c): `message_type` (`event`), `message_id`, `schema` (igual ao nome do tópico), `schema_version`, `producer` (`I7`), `occurred_at`, `published_at`, `captured_at`, `source_id`, `session_id`, `sequence`, `artifact_version` e `payload`. O `occurred_at` tem o mesmo valor de `captured_at` (quando o veículo foi visto).
+**Envelope** (guia do Kafka B2 + Arquitetura 6c): `message_type` (`event`), `message_id`, `schema` (igual ao nome do tópico), `schema_version`, `producer` (`I7`), `occurred_at`, `published_at`, `captured_at`, `source_id`, `session_id`, `sequence`, `artifact_version` e `payload`. O `occurred_at` **não consta na arquitetura 6c** (que usa `captured_at` e `published_at`): foi acrescentado porque o guia do Kafka B2 o define como campo obrigatório do envelope. Tem o mesmo valor de `captured_at` (quando o veículo foi visto).
 
 **Payload:**
 
@@ -139,7 +139,7 @@ Cada leitura **aceita pela validação de formato** vira um evento `ods.i7.plate
 
 ```json
 {
-  "message_type": "event", "message_id": "…", "schema": "ods.i7.plate_read", "schema_version": "1.1",
+  "message_type": "event", "message_id": "…", "schema": "ods.i7.plate_read", "schema_version": "1.0",
   "producer": "I7", "occurred_at": "2026-11-04T11:34:44.886Z", "published_at": "2026-11-04T11:34:44.886Z",
   "captured_at": "2026-11-04T11:34:44.886Z", "source_id": "cam-entrada", "session_id": "…", "sequence": 0,
   "artifact_version": "modelo4classesV1+cct-s-v2-global",
@@ -195,7 +195,7 @@ Testados e descartados (80 imagens de `test`): remover o pré-processamento (59 
 - O erro mais comum é a primeira letra: `O` lido como `D` (15 casos em 800).
 - Os scripts de treino dos modelos YOLO (e a geração dos rótulos por classe) não estão neste repositório. O `converterDataset-YOLO.py` gera apenas a classe `plate`.
 - `detection_id` é, por ora, apenas o índice da detecção no frame; não acompanha o mesmo veículo entre frames (previsto para quando houver tracking/votação).
-- A versão do esquema (`schema_version`) passou de `1.0` para `1.1` ao incluir os três campos novos; eventos antigos já gravados no tópico não os têm.
+- O evento segue o contrato `ods.i7.plate_read` da arquitetura 6c (`schema_version` 1.0), com algumas diferenças de significado nos campos `confidence`, `uncertain` e `detection_id`. Elas estão listadas em `MUDANCAS_VER5.md`. Mensagens publicadas antes de 04/11/2026 não têm `detection_id`, `character_confidences` e `uncertain`.
 - O campo `class` do evento é inferido: 1 linha = `car`, 2 linhas = `motorcycle` (a confirmar com o TRA-1).
 - O nome do tópico (`ods.i7.plate_read`) segue o padrão `ods.<componente>.<evento>` dos tópicos já existentes (`ods.i1.detections`, `ods.i6.code_read`), e não os domínios sugeridos no guia (que lista `ods.veiculo.placa_lida` para o I7). A confirmar com o TRA-1.
 - O broker é temporário (Google Cloud, compartilhado); a versão final usará um broker local, e só o `KAFKA_BROKER` precisa mudar.
