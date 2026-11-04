@@ -16,12 +16,12 @@ A build é de **controle de acesso veicular por placa em condomínios e empresas
 | Tarifa e pagamento | **Não será feita** |
 | Mapa de vagas (artefato ZONES, uma zona por vaga) | **Não será feito**; item 20 da Especificação (ZONES e RULES) não se aplica |
 | Ocupação de vagas (`ods.s1.zone_occupancy`) | **Não se aplica**; item 15 da Especificação |
-| Referencial da instalação e cadastro multi-câmera (CALIBRATION de I3) | **A revisar**; só ficam as dependências de S1, CALIBRATION e ZONES de que o controle de acesso precisar |
+| Referencial da instalação e cadastro multi-câmera (CALIBRATION de I3) | **Removido**, junto com as dependências do A8 em S1, CALIBRATION e ZONES (capacidades exclusivas de estacionamento) |
 | Regra de entrada: vaga livre + reserva válida | **Substituída** por: veículo cadastrado (empresa) ou convidado dentro do período |
 
 ## 2. Entrada e saída
 
-Na 6c, o I7 não informa se o veículo entra ou sai: o A8 decide a partir do `source_id` da leitura e das zonas de S1. **Mantivemos o princípio** (o I7 não publica movimento), mas, sem S1, o A8 decide **só pelo `source_id`**: `cam-entrada` aciona a cancela de entrada e `cam-saida`, a de saída.
+Na 6c, o I7 não informa se o veículo entra ou sai: o A8 decide a partir do `source_id` da leitura e das zonas de S1. **Mantivemos o princípio** (o I7 não publica movimento), mas **não usamos o S1 de forma alguma**. O A8 decide **somente pelo `source_id`**: `cam-entrada` aciona a cancela de entrada e `cam-saida`, a de saída.
 
 ## 3. Cancela (não existe na 6c)
 
@@ -33,7 +33,7 @@ A 6c não tem o componente que abre e fecha a cancela. Criamos um acionamento **
 - Evento com mais de **30 s** de atraso não abre nada.
 - A cancela simulada só **escreve no log** (`[CANCELA] ABRIR` / `FECHAR`).
 
-**Pendente:** definir o contrato e o squad responsável pelo acionamento real. Até lá, é só simulação (catraca virtual).
+Por enquanto é só simulação (catraca virtual).
 
 ## 4. Payload do I7: 6c × nossa build
 
@@ -46,17 +46,17 @@ O **tópico** (`ods.i7.plate_read`), o **esquema** e a **`schema_version` 1.0** 
 | `uncertain` | `true` quando a validação de formato **corrigiu ou rejeitou** algum caractere | `true` quando a **menor confiança** fica abaixo de `LIMIAR_INCERTEZA` (padrão 0.9). **Ainda não marcamos correções do formato**; leituras com formato inválido são rejeitadas e **não geram evento** |
 | `detection_id` | Detecção de **veículo** do I1 à qual a placa pertence (opcional, quando o I1 está na build) | Sem I1 na build: é só o **índice da placa no quadro** (0, 1, 2…). Passa a ter o sentido da 6c quando houver acompanhamento/votação |
 | `class` | Vocabulário do I1 (`car`, `motorcycle`) | Mesmos valores, **inferidos** pelo número de linhas da placa (1 = `car`, 2 = `motorcycle`) |
-| `frame_index` | Quadro do stream `ods.p4.frame` | Posição da imagem dentro da pasta processada (não há P4) |
-| `bbox` | Placa no quadro de P4 | Placa na imagem de entrada, em pixels |
+| `frame_index` | Quadro do stream `ods.p4.frame` | Posição da imagem dentro da pasta processada (a stream de P4 ainda não está disponível) |
+| `bbox` | Placa no quadro de P4 | Placa na imagem de entrada, em pixels (a stream de P4 ainda não está disponível) |
 | `license_plate`, `plate_layout` | 7 caracteres; `OLD_BR` ou `MERCOSUL` | Iguais |
 
 Diferenças no envelope e na origem dos dados:
 
 - `artifact_version`: a 6c exemplifica `lpr-br-2.1.0`; usamos `<modelo YOLO>+<modelo de OCR>` (configurável por `ARTIFACT_VERSION`).
 - `occurred_at`: **campo acrescentado ao envelope**, que não consta na 6c (ela usa `captured_at` e `published_at`). O guia do Kafka B2 o lista como campo **obrigatório** (`CAMPOS_OBRIGATORIOS`), e um consumidor no padrão do guia descarta a mensagem sem ele. Para o I7 é o mesmo instante de `captured_at` (quando o veículo foi visto), então os dois têm o mesmo valor. O `schema_version` continua `1.0`, pois o payload segue a 6c.
-- `session_id`: o I7 cria uma sessão por execução. A 6c prevê `ods.session.started` publicado por P4, P5 e P6; não consumimos nem publicamos esse marcador.
-- O I7 lê **imagens do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame` e usa a biblioteca de P2.
-- Como na 6c, o I7 **não grava evidência própria**. A 6c prevê que o A8 peça o recorte da placa a S4; **não implementamos esse pedido**.
+- `session_id`: o I7 cria uma sessão por execução. A 6c prevê `ods.session.started` publicado por P4, P5 e P6; como a stream de P4 ainda não está disponível, não consumimos nem publicamos esse marcador.
+- O I7 lê **imagens do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame` e usa a biblioteca de P2; usamos imagens do disco porque a stream de P4 ainda não está disponível.
+- Como na 6c, o I7 **não grava evidência própria**.
 
 Do lado do A8, o `uncertain` **ainda não é usado**: a decisão usa a `confidence` (mínimo 0,9), que dá o mesmo resultado hoje.
 
@@ -82,8 +82,7 @@ Variáveis do A8: `KAFKA_ATIVO`, `KAFKA_BROKER`, `KAFKA_TOPICO`, `KAFKA_GROUP_ID
 
 ## 6. Pendências
 
-- Aprovar o contrato e o squad do acionamento real da cancela.
-- Revisar as dependências do A8 em S1, CALIBRATION e ZONES.
+- Passar a consumir a stream `ods.p4.frame` quando ela estiver disponível.
 - Fazer o `uncertain` também marcar caracteres corrigidos pela validação de formato (como na 6c).
 - Acompanhar a mesma placa entre frames (votação) e dar ao `detection_id` o sentido da 6c.
 - Incluir o CNPJ no evento e filtrar por empresa no A8 (hoje a placa é procurada em qualquer empresa).
