@@ -9,33 +9,13 @@ Componente de **reconhecimento automático de placas** para controle de acesso v
 ## Fluxo
 
 ```
-imagem → YOLO (4 classes) → recorte (+ margem nas Mercosul) → OCR (cct-s-v2-global)
+imagem → detector YOLO (4 classes) → recorte (+ margem nas Mercosul) → OCR (cct-s-v2-global)
        → correção posicional + regex → resultado
                                          ├─ mosaico + resultados.csv
                                          └─ evento ods.i7.plate_read
                                               ├─ modo arquivo: eventos.jsonl (sem rede)
                                               └─ modo kafka:   tópico ods.i7.plate_read no broker
 ```
-
-## Início rápido (Docker)
-
-O componente roda em um **container Docker puro** (sem Dev Containers), que isola as bibliotecas e as chamadas de SO. É o jeito recomendado de executar e o que outras equipes devem usar.
-
-Requisitos: Docker Engine ou Docker Desktop instalado e **rodando** (os computadores do lab já vêm configurados) e a pasta `datasetConvertidoYOLO/` na raiz do projeto (ela não vai para o Git; veja `converterDataset-YOLO.py`).
-
-```bash
-cp .env.example .env     # ajuste os valores (sem aspas, caminhos relativos)
-./run.sh build           # constrói a imagem (só na primeira vez ou quando o código/requirements mudar)
-./run.sh                 # roda o pipeline com 20 imagens por pasta (teste rápido)
-```
-
-Para testar só a imagem, sem dataset nem rede:
-
-```bash
-./run.sh scripts/publicador_eventos.py --exemplo
-```
-
-Detalhes na seção [Execução com Docker](#execução-com-docker).
 
 ## Resultados da configuração atual
 
@@ -58,9 +38,7 @@ Medidos com a placa verdadeira do dataset (`placa` do `split_manifest.csv`), em 
 
 **Detecção (YOLO):** `modelos/modelo4classesV1/best.pt` (4 classes: `placa_1L_BR`, `placa_1L_ME`, `placa_2L_BR`, `placa_2L_ME`; BR = antiga, ME = Mercosul). O diretório também tem `modelos/modelo2classes/best.pt` (1 linha / 2 linhas), que o pipeline atual não usa.
 
-**OCR:** `cct-s-v2-global-model`, da biblioteca [fast-plate-ocr](https://github.com/ankandrew/fast-plate-ocr) (usada pelo Fast-ALPR). O modelo é baixado na primeira execução. Com Docker, ele fica guardado no volume `i7-ocr-cache` e não é baixado de novo.
-
-Se a sua rede bloquear o download (erro `CERTIFICATE_VERIFY_FAILED`), baixe os dois arquivos à mão:
+**OCR:** `cct-s-v2-global-model`, da biblioteca [fast-plate-ocr](https://github.com/ankandrew/fast-plate-ocr) (usada pelo Fast-ALPR). O modelo é baixado na primeira execução. Se a sua rede bloquear o download (erro `CERTIFICATE_VERIFY_FAILED`), baixe os dois arquivos à mão:
 
 ```powershell
 # Windows (PowerShell)
@@ -78,13 +56,6 @@ curl -L -o "$d/cct_s_v2_global.onnx" "$base/cct_s_v2_global.onnx"
 curl -L -o "$d/cct_s_v2_global_plate_config.yaml" "$base/cct_s_v2_global_plate_config.yaml"
 ```
 
-Para usar esses arquivos no Docker, copie-os para o volume do cache (Linux / macOS; a imagem precisa já estar construída):
-
-```bash
-docker run --rm -v i7-ocr-cache:/destino -v "$HOME/.cache/fast-plate-ocr:/origem" \
-  --entrypoint cp parkflow-i7 -r /origem/. /destino/
-```
-
 ## Arquivos (`scripts/`)
 
 | Arquivo | Função |
@@ -98,73 +69,7 @@ docker run --rm -v i7-ocr-cache:/destino -v "$HOME/.cache/fast-plate-ocr:/origem
 | `aplicarModelo-PastaImgs.py` | Primeiros testes: YOLO + EasyOCR/PaddleOCR (não está no `requirements.txt`) |
 | `aplicacaoModelov4-fastalpr.py` | Histórico: Fast-ALPR completo (detector + OCR). Não usado |
 
-## Execução com Docker
-
-### Arquivos envolvidos
-
-| Arquivo | Função |
-|---|---|
-| `Dockerfile` | Imagem `python:3.11-slim`, PyTorch para CPU, dependências do `requirements.txt`, `modelos/` e `scripts/` |
-| `.dockerignore` | Mantém `.env`, `.git`, `saidas/` e o dataset fora da imagem |
-| `run.sh` | Atalho que monta os volumes, passa o `.env` e executa o script pedido dentro do container |
-
-### Uso do `run.sh`
-
-Tudo que vem depois de `./run.sh` é executado dentro do container com `python`:
-
-```bash
-./run.sh build                                          # constrói a imagem (parkflow-i7)
-./run.sh                                                # pipeline, 20 imagens por pasta (teste rápido)
-./run.sh scripts/aplicacaoModelov5-fast+rodosol.py      # pipeline completo, todas as imagens
-./run.sh scripts/comprovacaoAcertos.py --saida saidas   # mede os acertos
-./run.sh scripts/comprovacaoAcertos.py --comparar saidas/exp_a saidas/exp_b
-./run.sh scripts/publicador_eventos.py --exemplo        # evento de exemplo
-./run.sh scripts/consumidor_teste.py                    # confere o que chegou no Kafka
-```
-
-O `run.sh` monta três volumes:
-
-| Volume | Destino no container | Para quê |
-|---|---|---|
-| `./datasetConvertidoYOLO` | `/app/datasetConvertidoYOLO` | Imagens de entrada (e o `split_manifest.csv`) |
-| `./saidas` | `/app/saidas` | Mosaicos, CSVs e `eventos.jsonl` aparecem na sua máquina |
-| `i7-ocr-cache` (volume nomeado) | `/root/.cache/fast-plate-ocr` | Guarda o modelo OCR entre execuções |
-
-### Comando completo (sem o `run.sh`)
-
-Equivale ao `run.sh` e serve para Windows sem Git Bash ou para quem quiser ver o que acontece.
-
-```bash
-# Linux / macOS / Git Bash
-docker run --rm --env-file .env \
-  -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
-  -v "$(pwd)/saidas:/app/saidas" \
-  -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
-  parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 20
-```
-
-```powershell
-# Windows (PowerShell)
-docker run --rm --env-file .env `
-  -v "${PWD}/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" `
-  -v "${PWD}/saidas:/app/saidas" `
-  -v i7-ocr-cache:/root/.cache/fast-plate-ocr `
-  parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 20
-```
-
-### Cuidados
-
-- **`.env`:** valores **sem aspas** (o `--env-file` não as remove) e caminhos **relativos** à raiz do projeto, como `PASTA_SAIDA=saidas`. Caminhos do Windows (`C:\...`) não funcionam dentro do container.
-- **Alterou um script ou o `requirements.txt`?** Rode `./run.sh build` de novo. Os scripts são copiados para dentro da imagem na construção.
-- **Desenvolvendo sem reconstruir a cada mudança:** acrescente `-v "$(pwd)/scripts:/app/scripts"` ao comando completo, para o container usar sempre a versão atual dos scripts. Antes de integrar na `main`, faça um `./run.sh build` final sem esse volume.
-- **Arquivos em `saidas/` com dono `root` (Linux):** o container roda como root. Se não conseguir editar ou apagar, use `sudo chown -R $USER:$USER saidas`.
-- **Permissão no Linux (`permission denied` ao usar `docker`):** adicione seu usuário ao grupo com `sudo usermod -aG docker $USER` e saia e entre de novo na sessão.
-- **Kafka:** o container acessa o broker pela rede da máquina. Basta `PUBLICACAO_MODO=kafka` e `KAFKA_BROKER` no `.env`.
-- **Dependências do projeto:** não instale nada com `pip` na sua máquina para rodar o componente. Tudo vem na imagem.
-
-## Instalação local (alternativa, sem Docker)
-
-Use apenas para depurar. O caminho oficial é o container.
+## Instalação
 
 ```bash
 python -m venv .venv
@@ -174,11 +79,9 @@ pip install -r requirements.txt
 
 Requer Python 3.10 ou mais novo. O `fast-alpr` precisa do extra `[onnx]` (já está no `requirements.txt`). Sem GPU, instale antes o PyTorch para CPU (`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`), que é bem menor.
 
-Nesse modo, os scripts rodam com `python scripts/<arquivo>.py`, em vez de `./run.sh scripts/<arquivo>.py`.
-
 ## Configuração (`.env`)
 
-Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do projeto. O `.env` não vai para o Git (o `.env.example` vai). Valores definidos no terminal têm prioridade sobre o `.env`. No Docker, use valores sem aspas.
+Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do projeto. O `.env` não vai para o Git (o `.env.example` vai). Valores definidos no terminal têm prioridade sobre o `.env`.
 
 | Variável | Padrão no código | Valor recomendado | O que faz |
 |---|---|---|---|
@@ -186,35 +89,35 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `PASTA_SAIDA` | `saidas` | `saidas` | Saída (com várias pastas de entrada, uma subpasta por categoria) |
 | `PASTA_DATASET` | `datasetConvertidoYOLO` | idem | Raiz do dataset (usada pelo `comprovacaoAcertos.py`) |
 | `CAMINHO_MODELO_YOLO` | `modelos/modelo4classesV1/best.pt` | idem | Modelo de detecção |
+| `DETECTOR` | `ultralytics` | **`p2`** (ou `ultralytics`, ver abaixo) | `ultralytics` usa o `best.pt`; `p2` usa o pacote do B5 pela biblioteca P2 |
+| `P2_ENGINE_REF` | `app-plates-1.0.0` | idem | Engine do P2 (só com `DETECTOR=p2`) |
 | `OCR_MODELO` | `global-plates-mobile-vit-v2-model` | **`cct-s-v2-global-model`** | Modelo de OCR |
 | `MARGEM_RECORTE_MERCOSUL_PCT` | vazio (usa a geral) | **`10`** | Margem (% da caixa) só nas placas Mercosul |
 | `MARGEM_RECORTE_PCT` | `0` | `0` | Margem para as demais placas |
 | `PREPROCESSAMENTO` | `sim` | `sim` | Cinza + 2x + CLAHE + filtro antes do OCR |
 | `PUBLICACAO_MODO` | `arquivo` | `arquivo` (`kafka` só para publicar de verdade) | `arquivo` grava `eventos.jsonl`; `kafka` envia ao broker; `desligado` não gera eventos |
 | `SOURCE_ID` | `cam-entrada` | `cam-entrada` | Câmera/portão de origem do evento |
-| `ARTIFACT_VERSION` | modelo YOLO + OCR | opcional | Versão do artefato no evento |
+| `ARTIFACT_VERSION` | detector + OCR | opcional | Versão do artefato no evento (com `DETECTOR=p2`: `app-plates-1.0.0-fp32+cct-s-v2-global`) |
 | `LIMIAR_INCERTEZA` | `0.9` | `0.9` | Se a menor confiança entre os caracteres ficar abaixo disso, o evento sai com `uncertain: true` |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
 | `KAFKA_BROKER` | `34.66.235.91:9093` | idem (temporário) | Endereço do broker; na versão final será local |
 
 Experimentais (sem ganho nos testes, ficam desligados): `DOBRAR_2L` (`nao`/`auto`/`fixo`/`separar`; `separar` lê cada linha da placa de moto sozinha e junta o resultado, ainda em avaliação), `DOBRAR_DIVISAO_PCT`, `DOBRAR_FOLGA_PCT`, `DOBRAR_DESCARTE_TOPO_PCT`. Pré-processamento do recorte: `PRE_ALTURA_ALVO=160` (amplia o recorte até essa altura em pixels) e `PRE_PROPORCAO=2` (completa as laterais do recorte até uma proporção largura/altura, em vez de esticar) estão recomendados no `.env.example`: nas 400 motos subiram de 71,8% para 75,5% de placas corretas e os carros ficaram iguais. `PRE_NITIDEZ` (realce de nitidez) piorou nos testes e fica em 0. Com 0 em todos, vale o comportamento original.
 
-## Como usar
+**Detector via P2 (`DETECTOR=p2`).** O pacote do B5 (`app-plates` 1.0.0: `app-plates.onnx`, `metadata.json`, `descriptor.json`) fica em `modelos/app-plates-1.0.0/`. O `Dockerfile` instala a biblioteca P2 (SIS-1, sem alterá-la) e roda `p2-build --cpu-only` nesse pacote, que confere o hash do ONNX e gera o engine. O `scripts/detector_p2.py` chama `p2.load`, `p2.infer`, `p2.info` e `p2.release`, faz o pré-processamento (letterbox, BGR→RGB, ÷255) e o pós-processamento (limiar 0,25, NMS 0,7, volta às coordenadas da imagem) e devolve as caixas no mesmo formato da ultralytics, então o resto do pipeline não muda. Com `DETECTOR=p2`, o `artifact_version` dos eventos é a versão que o P2 informa (`app-plates-1.0.0-fp32` na CPU; `-fp16` na Jetson). Em 200 imagens (50 por pasta), o P2 e a ultralytics acertaram o mesmo total (167, 83,5%) e o P2 levou 1 min 55 s contra 3 min 59 s. O OCR continua fora do P2. Fora do Docker: `pip install --no-deps https://github.com/ods-26-2/p2/releases/download/v0.1.0/p2-0.1.0-py3-none-any.whl onnx`, depois `p2-build modelos/app-plates-1.0.0 --cpu-only --engine-dir <pasta>` e `P2_ENGINE_DIR=<pasta>`.
 
-Com Docker (recomendado):
+## Como usar
 
 ```bash
 # processa as imagens (-n N processa só as N primeiras de cada pasta, para testes rápidos)
-./run.sh scripts/aplicacaoModelov5-fast+rodosol.py -n 20
+python scripts/aplicacaoModelov5-fast+rodosol.py -n 20
 
 # mede quantas placas estavam corretas e gera o painel de gráficos
-./run.sh scripts/comprovacaoAcertos.py --saida saidas
+python scripts/comprovacaoAcertos.py --saida saidas
 
 # compara experimentos (a primeira pasta é a referência)
-./run.sh scripts/comprovacaoAcertos.py --comparar saidas/exp_a saidas/exp_b
+python scripts/comprovacaoAcertos.py --comparar saidas/exp_a saidas/exp_b
 ```
-
-Sem Docker, troque `./run.sh` por `python` (por exemplo, `python scripts/comprovacaoAcertos.py --saida saidas`).
 
 Para comparar configurações, rode o pipeline uma vez para cada uma, cada qual com seu `PASTA_SAIDA`. Rode sobre as pastas `images/<split>` do dataset convertido, para os nomes dos arquivos baterem com o `split_manifest.csv`. Use `val` para decidir e `test` só para o número final.
 
@@ -251,14 +154,14 @@ Cada leitura **aceita pela validação de formato** vira um evento `ods.i7.plate
 }
 ```
 
-Um evento de exemplo completo sai de `./run.sh scripts/publicador_eventos.py --exemplo`.
+Um evento de exemplo completo sai de `python scripts/publicador_eventos.py --exemplo`.
 
 **Para publicar no Kafka:**
 
 1. No `.env`: `PUBLICACAO_MODO=kafka`, e confira `KAFKA_BROKER` e `KAFKA_TOPICO`.
-2. Na primeira vez, crie o tópico (se ele ainda não existir): `./run.sh scripts/publicador_eventos.py --criar-topico`.
-3. Rode o pipeline com poucas imagens (`./run.sh scripts/aplicacaoModelov5-fast+rodosol.py -n 2`). O resumo de cada pasta mostra quantos eventos o broker confirmou.
-4. Confira o que chegou: `./run.sh scripts/consumidor_teste.py`. Ele para sozinho depois de 15 s sem mensagens e não grava posição de leitura, então pode ser repetido.
+2. Na primeira vez, crie o tópico (se ele ainda não existir): `python scripts/publicador_eventos.py --criar-topico`.
+3. Rode o pipeline com poucas imagens (`-n 2`). O resumo de cada pasta mostra quantos eventos o broker confirmou.
+4. Confira o que chegou: `python scripts/consumidor_teste.py`. Ele para sozinho depois de 15 s sem mensagens e não grava posição de leitura, então pode ser repetido.
 
 **Cuidados com o broker (compartilhado, na nuvem):**
 
@@ -269,8 +172,6 @@ Um evento de exemplo completo sai de `./run.sh scripts/publicador_eventos.py --e
 - Os eventos dos testes de integração ficam no tópico (têm `source_id` `cam-entrada`). Não são leituras reais.
 
 ## Saídas (em cada pasta de saída)
-
-Com Docker, as saídas aparecem na pasta `saidas/` da sua máquina.
 
 - `<imagem>_mosaico.jpg`: imagem com a detecção, o recorte que o OCR viu e o texto lido.
 - `resultados.csv`: imagem, placa lida, tipo, confiança da detecção, confiança média do OCR, **texto bruto do OCR**, confiança mínima e confiança por caractere.

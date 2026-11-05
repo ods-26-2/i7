@@ -1,0 +1,27 @@
+{
+    "artifact_id": "app-plates",
+    "artifact_version": "1.0.0",
+    "classes": [
+        "placa_1L_BR",
+        "placa_1L_ME",
+        "placa_2L_BR",
+        "placa_2L_ME"
+    ],
+    "input_shape": [
+        1,
+        3,
+        640,
+        640
+    ],
+    "precision": "FP32",
+    "metrics": {
+        "evaluation_split": "test",
+        "mAP50": 0.995,
+        "mAP50_95": 0.9581,
+        "precision": 0.999,
+        "recall": 1.0
+    },
+    "dataset_version": "1.0.0",
+    "onnx_file": "app-plates.onnx",
+    "hash_sha256": "b698a519e92752fab804c4cb1556547d79713b15f7cd6d543d3760aeadb46521"
+}

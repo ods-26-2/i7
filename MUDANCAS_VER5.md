@@ -52,10 +52,11 @@ O **tópico** (`ods.i7.plate_read`), o **esquema** e a **`schema_version` 1.0** 
 
 Diferenças no envelope e na origem dos dados:
 
-- `artifact_version`: a 6c exemplifica `lpr-br-2.1.0`; usamos `<modelo YOLO>+<modelo de OCR>` (configurável por `ARTIFACT_VERSION`).
+- `artifact_version`: a 6c exemplifica `lpr-br-2.1.0`; usamos `<detector>+<modelo de OCR>` (configurável por `ARTIFACT_VERSION`). Com `DETECTOR=p2`, a parte do detector é a versão que o P2 informa (`app-plates-1.0.0-fp32`); com `DETECTOR=ultralytics` (padrão), é o nome da pasta do `best.pt`. O OCR (`cct-s-v2-global`) não está no registro de B5 e não passa pelo P2.
 - `occurred_at`: **campo acrescentado ao envelope**, que não consta na 6c (ela usa `captured_at` e `published_at`). O guia do Kafka B2 o lista como campo **obrigatório** (`CAMPOS_OBRIGATORIOS`), e um consumidor no padrão do guia descarta a mensagem sem ele. Para o I7 é o mesmo instante de `captured_at` (quando o veículo foi visto), então os dois têm o mesmo valor. O `schema_version` continua `1.0`, pois o payload segue a 6c.
 - `session_id`: o I7 cria uma sessão por execução. A 6c prevê `ods.session.started` publicado por P4, P5 e P6; como a stream de P4 ainda não está disponível, não consumimos nem publicamos esse marcador.
-- O I7 lê **imagens do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame` e usa a biblioteca de P2; usamos imagens do disco porque a stream de P4 ainda não está disponível.
+- O I7 lê **imagens do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame`; usamos imagens do disco porque a stream de P4 ainda não está disponível.
+- **P2 e B5:** na 6c o modelo vem do registro de B5 e é carregado pela biblioteca P2. O pacote `app-plates` 1.0.0 (B5/MOD-1) já está no projeto e é o detector recomendado no `.env.example` (`DETECTOR=p2`); o `best.pt` pela ultralytics continua disponível (`DETECTOR=ultralytics`) e os dois arquivos de pesos são idênticos (mesmo SHA-256). Em 200 imagens, os dois acertaram 167 (83,5%), e o P2 foi mais rápido (1 min 55 s contra 3 min 59 s). Na Jetson, o P2 compila o mesmo pacote em TensorRT FP16; aqui, no Docker, roda em CPU. Não consumimos ainda o aviso `ods.artifact.published`: a versão é fixada na construção da imagem.
 - Como na 6c, o I7 **não grava evidência própria**.
 
 Do lado do A8, o `uncertain` **ainda não é usado**: a decisão usa a `confidence` (mínimo 0,9), que dá o mesmo resultado hoje.
@@ -83,6 +84,7 @@ Variáveis do A8: `KAFKA_ATIVO`, `KAFKA_BROKER`, `KAFKA_TOPICO`, `KAFKA_GROUP_ID
 ## 6. Pendências
 
 - Passar a consumir a stream `ods.p4.frame` quando ela estiver disponível.
+- Confirmar o `DETECTOR=p2` nas 800 imagens (a comparação feita foi com 200) e rodar o P2 na Jetson (TensorRT FP16, com SIS-1 e a imagem base de P3). O OCR continua fora do P2, por decisão do squad.
 - Fazer o `uncertain` também marcar caracteres corrigidos pela validação de formato (como na 6c).
 - Acompanhar a mesma placa entre frames (votação) e dar ao `detection_id` o sentido da 6c.
 - Incluir o CNPJ no evento e filtrar por empresa no A8 (hoje a placa é procurada em qualquer empresa).
