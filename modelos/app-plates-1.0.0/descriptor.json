@@ -1,0 +1,9 @@
+{
+    "artifact_id": "app-plates",
+    "artifact_version": "1.0.0",
+    "kind": "MODEL",
+    "owner": "MOD-1",
+    "uri": "B5/artifacts/app-plates/1.0.0/app-plates.onnx",
+    "hash_sha256": "b698a519e92752fab804c4cb1556547d79713b15f7cd6d543d3760aeadb46521",
+    "valid_from": "2026-10-20T14:01:44.232Z"
+}
