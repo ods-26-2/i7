@@ -81,7 +81,33 @@ O pipeline precisa da pasta `datasetConvertidoYOLO/` na raiz do projeto. Ela **n
 - Linux: se `saidas/` ficar com dono `root`, use `sudo chown -R $USER:$USER saidas`.
 - Linux: `permission denied` ao usar `docker` significa que falta o passo 1 e sair/entrar na sessão.
 - Windows: erro `$'\r': command not found` no `run.sh` é quebra de linha do Windows. Corrija com `dos2unix run.sh`.
-- Ao publicar no Kafka, use `-n` pequeno e não deixe produtores ou consumidores rodando em segundo plano.
+- Ao publicar no Kafka, use `-n` pequeno e não deixe produtores ou consumidores rodando em segundo plano. Pare a ponte (Ctrl+C) quando terminar.
+- Erro `localhost:9092 ... Connection refused` ao publicar: a ponte não está rodando ou o container não usou `--network container:ponte`.
+- Docker no Windows sem alcançar o broker (`nc ... timed out` num container): se existir uma rede Docker na faixa `172.18.0.0/16` (por exemplo `a8_default`), remova-a com `docker network rm`.
+
+## Publicar no Kafka da Jetson
+
+O broker fica na rede do Dcomp: `172.18.4.56:9092` por dentro, `200.17.66.56:9092` por fora (ponha o seu no `KAFKA_BROKER` do `.env`). Ele ainda anuncia `localhost:9092`, então é preciso uma **ponte** em outro terminal e rodar o container na rede dela. O `run.sh` e o `run.ps1` não fazem isso.
+
+```bash
+# Terminal 1 (fica aberto; Ctrl+C no fim). Troque <ip> pelo endereço que vale para você.
+docker rm -f ponte
+docker run --rm --name ponte alpine/socat TCP-LISTEN:9092,fork,reuseaddr TCP:<ip>:9092
+```
+
+```bash
+# Terminal 2, na pasta do projeto (Linux / Git Bash). Use -n pequeno.
+docker run --rm --env-file .env --network container:ponte \
+  -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
+  -v "$(pwd)/saidas:/app/saidas" \
+  -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
+  parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 2
+
+# Conferir (só o que ainda não foi lido por este consumidor):
+docker run --rm --env-file .env --network container:ponte parkflow-i7 scripts/consumidor_teste.py --novas
+```
+
+No PowerShell, troque `\` por `` ` `` e `$(pwd)` por `${PWD}`. O `.env` precisa de `PUBLICACAO_MODO=kafka`. Detalhes e outros modos do consumidor (`--ao-vivo`) no `README.md`.
 
 ## Comando completo (sem o `run.sh`)
 

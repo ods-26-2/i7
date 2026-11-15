@@ -317,8 +317,9 @@ class PublicadorArquivo:
 
 
 def broker() -> str:
-    """Endereço do broker (guia B2: configurável, nunca fixo no código)."""
-    return os.environ.get("KAFKA_BROKER", "").strip() or "34.66.235.91:9093"
+    """Endereço do broker (guia B2: configurável, nunca fixo no código).
+    O padrão é o da Jetson vista de dentro do Dcomp; de fora, use o endereço público no .env."""
+    return os.environ.get("KAFKA_BROKER", "").strip() or "172.18.4.56:9092"
 
 
 _PRODUCER = None   # um único produtor por execução: evita reconectar ao broker a cada pasta

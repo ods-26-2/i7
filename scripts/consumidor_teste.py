@@ -8,12 +8,20 @@ do guia? Não altera nada no tópico.
 Cuidados com o broker compartilhado (guia, seção 4.5):
   - o poll é de 1 s e o programa PARA sozinho (sem mensagem nova por --espera segundos, ou
     ao atingir --max mensagens). Não deixe rodando em segundo plano;
-  - não grava posição de leitura (enable.auto.commit=False), então cada execução relê o
-    tópico desde o início, sem atrapalhar o group.id de outro componente.
+  - os group.id deste script são só dele (nunca o do app), então ler por aqui não atrapalha
+    o funcionamento de outro componente.
+
+Modos de leitura:
+  (sem opção)  relê o tópico desde o início; não grava posição, então pode repetir à vontade
+  --novas      lê só o que este consumidor ainda não leu e grava a posição ao terminar
+               (group.id próprio; na primeira vez lê tudo, depois só o que chegou desde a última)
+  --ao-vivo    lê só o que for publicado com o consumidor ligado (ignora o que já está no tópico)
 
 Uso:
     python scripts/consumidor_teste.py
     python scripts/consumidor_teste.py --max 10 --espera 15
+    python scripts/consumidor_teste.py --novas
+    python scripts/consumidor_teste.py --ao-vivo
 
 O endereço do broker e o tópico vêm do .env (KAFKA_BROKER, KAFKA_TOPICO).
 """
@@ -31,7 +39,9 @@ except ImportError:
 
 import publicador_eventos as pe
 
-GROUP_ID = "I7-verificacao"   # só deste script; o app usa o group.id dele
+GROUP_ID = "I7-verificacao"               # só deste script; não grava posição (relê tudo)
+GROUP_ID_NOVAS = "I7-verificacao-novas"   # só deste script; grava a posição lida (--novas)
+# O app (A8) usa o group.id dele (A8-acesso); estes dois não interferem nele.
 
 # --- Validação do guia B2, seção 4.3 (o que um consumidor típico confere) ---------------
 CAMPOS_OBRIGATORIOS = ["message_id", "message_type", "schema", "schema_version",
@@ -64,6 +74,13 @@ def main():
     parser.add_argument("--max", type=int, default=50, help="para depois de ler N mensagens (padrão 50)")
     parser.add_argument("--espera", type=float, default=15,
                         help="para após N segundos sem mensagem nova (padrão 15)")
+    modo = parser.add_mutually_exclusive_group()
+    modo.add_argument("--novas", action="store_true",
+                      help="lê só as mensagens que este consumidor ainda não leu e grava a posição "
+                           "ao terminar (group.id próprio, diferente do app)")
+    modo.add_argument("--ao-vivo", action="store_true", dest="ao_vivo",
+                      help="lê só as mensagens publicadas depois que o script iniciou "
+                           "(ignora o que já está no tópico)")
     args = parser.parse_args()
 
     try:
@@ -72,14 +89,21 @@ def main():
         raise SystemExit("[ERRO] Instale a biblioteca: pip install confluent-kafka")
 
     topico = pe.topico()
+    group_id = GROUP_ID_NOVAS if args.novas else GROUP_ID
+    nome_modo = ("ainda não lidas (grava a posição ao terminar)" if args.novas
+                 else "só as publicadas com o consumidor ligado" if args.ao_vivo
+                 else "desde o início (não grava posição)")
     consumidor = Consumer({
         "bootstrap.servers": pe.broker(),
-        "group.id": GROUP_ID,
-        "auto.offset.reset": "earliest",   # sem posição salva, começa da mensagem mais antiga
-        "enable.auto.commit": False,       # não grava posição: a próxima execução relê tudo
+        "group.id": group_id,
+        # sem posição salva: "earliest" começa da mensagem mais antiga; "latest" (--ao-vivo) só das novas.
+        # Com --novas, a primeira execução lê tudo e as seguintes continuam de onde parou.
+        "auto.offset.reset": "latest" if args.ao_vivo else "earliest",
+        "enable.auto.commit": False,       # a posição só é gravada de propósito, no fim (--novas)
     })
     consumidor.subscribe([topico])
-    print(f"Lendo '{topico}' em {pe.broker()} (group.id={GROUP_ID}). "
+    print(f"Lendo '{topico}' em {pe.broker()} (group.id={group_id}). "
+          f"Modo: {nome_modo}. "
           f"Para após {args.espera:g} s sem mensagens ou {args.max} lidas.\n")
 
     lidas = ok_guia = ok_i7 = descartadas = 0
@@ -114,6 +138,12 @@ def main():
                   f"conf={p['confidence']:.3f} seq={evento.get('sequence', '?')} "
                   f"src={evento.get('source_id', '?')} sessão={str(evento.get('session_id', '?'))[:8]}"
                   + ("" if not erros_i7 else f"  | contrato I7: {'; '.join(erros_i7[:2])}"))
+        if args.novas and lidas:
+            try:
+                consumidor.commit(asynchronous=False)   # grava a posição: a próxima execução segue daqui
+                print("\nPosição de leitura gravada (a próxima execução com --novas continua daqui).")
+            except Exception as erro:
+                logging.warning("não foi possível gravar a posição: %s", erro)
     finally:
         consumidor.close()
 
