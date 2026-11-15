@@ -68,7 +68,8 @@ Do lado do A8, o `uncertain` **ainda não é usado**: a decisão usa a `confiden
 1. Copie `.env.example` para `.env` e ajuste os caminhos. O `.env` **não vai para o git**.
 2. Teste sem broker: `PUBLICACAO_MODO=arquivo` e rode `python scripts/aplicacaoModelov5-fast+rodosol.py -n 2`. Os eventos ficam em `saidas/<pasta>/eventos.jsonl`.
 3. Para publicar de verdade: `PUBLICACAO_MODO=kafka` e, na primeira vez, `python scripts/publicador_eventos.py --criar-topico`.
-4. Para conferir o que chegou ao broker: `python scripts/consumidor_teste.py --max 60`.
+4. Para conferir o que chegou ao broker: `python scripts/consumidor_teste.py --max 60`. Opções: `--novas` (só o que ainda não leu; grava a posição num `group.id` próprio) e `--ao-vivo` (só o que chegar com ele ligado). Nenhuma usa o `group.id` do A8.
+5. Broker da Jetson: dentro do Dcomp, `KAFKA_BROKER=172.18.4.56:9092`; de fora, `200.17.66.56:9092`. Como o broker anuncia `localhost:9092`, é preciso uma ponte `socat` e rodar o container com `--network container:ponte` (passo a passo no `README.md`, seção "Acesso ao broker da Jetson").
 
 > O broker é **temporário e compartilhado** (gasta créditos do projeto). Use sempre `-n` pequeno e não deixe processos rodando em laço.
 
@@ -88,4 +89,5 @@ Variáveis do A8: `KAFKA_ATIVO`, `KAFKA_BROKER`, `KAFKA_TOPICO`, `KAFKA_GROUP_ID
 - Fazer o `uncertain` também marcar caracteres corrigidos pela validação de formato (como na 6c).
 - Acompanhar a mesma placa entre frames (votação) e dar ao `detection_id` o sentido da 6c.
 - Incluir o CNPJ no evento e filtrar por empresa no A8 (hoje a placa é procurada em qualquer empresa).
+- Pedir a correção do `advertised.listeners` da Jetson (hoje anuncia `localhost:9092`), o que dispensa a ponte `socat` no I7 e no A8.
 - Trocar o broker temporário por um broker local.

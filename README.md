@@ -62,7 +62,7 @@ curl -L -o "$d/cct_s_v2_global_plate_config.yaml" "$base/cct_s_v2_global_plate_c
 |---|---|
 | `aplicacaoModelov5-fast+rodosol.py` | **Pipeline atual:** YOLO de 4 classes + OCR + validação, com mosaicos, CSV e publicação de eventos |
 | `publicador_eventos.py` | Monta e valida o evento `ods.i7.plate_read` (envelope da Arquitetura 6c + guia do Kafka) e o publica (arquivo, Kafka ou nada). Também funciona sozinho: `--exemplo`, `--validar` e `--criar-topico` |
-| `consumidor_teste.py` | Lê o tópico e valida cada evento como um consumidor faria (guia do Kafka, seções 4.2 e 4.3). Serve para conferir o que foi publicado |
+| `consumidor_teste.py` | Lê o tópico e valida cada evento como um consumidor faria (guia do Kafka, seções 4.2 e 4.3). Serve para conferir o que foi publicado. Modos: sem opção (relê tudo), `--novas` (só o que ainda não leu) e `--ao-vivo` (só o que chegar com ele ligado) |
 | `comprovacaoAcertos.py` | Compara o `resultados.csv` com a placa verdadeira: acertos, erros por posição, confiança. `--comparar` põe experimentos lado a lado |
 | `converterDataset-YOLO.py` | Converte o RodoSol/UFPR-ALPR para o formato YOLO (split train/val/test) e grava o `split_manifest.csv` com a placa verdadeira |
 | `comprovacaoResultados.py` | Gráficos rápidos de validade de formato (usados na Sprint 2; não medem acerto) |
@@ -100,7 +100,7 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `ARTIFACT_VERSION` | detector + OCR | opcional | Versão do artefato no evento (com `DETECTOR=p2`: `app-plates-1.0.0-fp32+cct-s-v2-global`) |
 | `LIMIAR_INCERTEZA` | `0.9` | `0.9` | Se a menor confiança entre os caracteres ficar abaixo disso, o evento sai com `uncertain: true` |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
-| `KAFKA_BROKER` | `34.66.235.91:9093` | idem (temporário) | Endereço do broker; na versão final será local |
+| `KAFKA_BROKER` | `172.18.4.56:9092` | `172.18.4.56:9092` (dentro do Dcomp) ou `200.17.66.56:9092` (fora) | Endereço do broker da Jetson (temporário); na versão final será local. Ver "Acesso ao broker da Jetson" |
 
 Experimentais (sem ganho nos testes, ficam desligados): `DOBRAR_2L` (`nao`/`auto`/`fixo`/`separar`; `separar` lê cada linha da placa de moto sozinha e junta o resultado, ainda em avaliação), `DOBRAR_DIVISAO_PCT`, `DOBRAR_FOLGA_PCT`, `DOBRAR_DESCARTE_TOPO_PCT`. Pré-processamento do recorte: `PRE_ALTURA_ALVO=160` (amplia o recorte até essa altura em pixels) e `PRE_PROPORCAO=2` (completa as laterais do recorte até uma proporção largura/altura, em vez de esticar) estão recomendados no `.env.example`: nas 400 motos subiram de 71,8% para 75,5% de placas corretas e os carros ficaram iguais. `PRE_NITIDEZ` (realce de nitidez) piorou nos testes e fica em 0. Com 0 em todos, vale o comportamento original.
 
@@ -161,9 +161,42 @@ Um evento de exemplo completo sai de `python scripts/publicador_eventos.py --exe
 1. No `.env`: `PUBLICACAO_MODO=kafka`, e confira `KAFKA_BROKER` e `KAFKA_TOPICO`.
 2. Na primeira vez, crie o tópico (se ele ainda não existir): `python scripts/publicador_eventos.py --criar-topico`.
 3. Rode o pipeline com poucas imagens (`-n 2`). O resumo de cada pasta mostra quantos eventos o broker confirmou.
-4. Confira o que chegou: `python scripts/consumidor_teste.py`. Ele para sozinho depois de 15 s sem mensagens e não grava posição de leitura, então pode ser repetido.
+4. Confira o que chegou com `python scripts/consumidor_teste.py`. Ele para sozinho depois de 15 s sem mensagens (`--espera`) ou ao ler 50 (`--max`). Há três modos:
+   - sem opção: relê o tópico desde o início e não grava posição, então pode ser repetido;
+   - `--novas`: lê só o que este consumidor ainda não leu e grava a posição ao terminar (`group.id` próprio, `I7-verificacao-novas`; na primeira vez lê tudo);
+   - `--ao-vivo`: lê só o que for publicado com ele ligado. Inicie-o, espere uns 5 s e publique; ele não altera a posição do `--novas`.
 
-**Cuidados com o broker (compartilhado, na nuvem):**
+   Nenhum dos modos usa o `group.id` do A8 (`A8-acesso`), então conferir por aqui não atrapalha o app.
+
+### Acesso ao broker da Jetson
+
+O broker (`172.18.4.56:9092`, sem TLS) fica na rede do Dcomp. De dentro dela use esse endereço; de fora, o público (`200.17.66.56:9092`), que não funciona de dentro. Teste a porta antes: `nc -zv -w 5 <ip> 9092` (Linux) ou `Test-NetConnection <ip> -Port 9092` (PowerShell).
+
+**Problema do `localhost:9092`.** O broker ainda anuncia `localhost:9092` (`advertised.listeners`). O cliente conecta, recebe esse endereço e falha com `Connect to ipv4#127.0.0.1:9092 failed`. A correção definitiva é no broker (anunciar o endereço real). Enquanto isso, use uma **ponte** (`socat`) e rode o container na rede dela. São dois terminais:
+
+```bash
+# Terminal 1 (fica aberto; Ctrl+C no fim). Troque <ip> pelo endereço que vale para você.
+docker rm -f ponte
+docker run --rm --name ponte alpine/socat TCP-LISTEN:9092,fork,reuseaddr TCP:<ip>:9092
+```
+
+```bash
+# Terminal 2, na pasta do projeto (Linux / Git Bash). No PowerShell, troque \ por ` e $(pwd) por ${PWD}.
+docker run --rm --env-file .env --network container:ponte \
+  -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
+  -v "$(pwd)/saidas:/app/saidas" \
+  -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
+  parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 2
+
+# O consumidor usa a mesma ponte (não precisa dos volumes):
+docker run --rm --env-file .env --network container:ponte parkflow-i7 scripts/consumidor_teste.py --novas
+```
+
+O `run.sh` e o `run.ps1` não usam a rede da ponte; com a ponte, use o `docker run` acima. Se o `.env` tiver o endereço de um lado e você estiver do outro, acrescente `-e KAFKA_BROKER=localhost:9092` ao `docker run`. Sem a ponte rodando, o erro volta a ser `localhost:9092 ... Connection refused`.
+
+Se o `docker network` do seu computador (por exemplo, a rede `a8_default` do Compose do A8) usar a faixa `172.18.0.0/16`, os containers não alcançam `172.18.4.56`. Remova essa rede (`docker network rm`) ou mude a sub-rede dela.
+
+**Cuidados com o broker (compartilhado, na Jetson):**
 
 - Cada execução usa **um só produtor** e termina com `flush`; não há laços de reenvio.
 - O consumidor de teste faz poll de 1 s e para sozinho. Não deixe consumidores ou produtores de teste rodando em segundo plano.
@@ -202,4 +235,4 @@ Testados e descartados (80 imagens de `test`): remover o pré-processamento (59 
 - O evento segue o contrato `ods.i7.plate_read` da arquitetura 6c (`schema_version` 1.0), com algumas diferenças de significado nos campos `confidence`, `uncertain` e `detection_id`. Elas estão listadas em `MUDANCAS_VER5.md`. Mensagens publicadas antes de 04/11/2026 não têm `detection_id`, `character_confidences` e `uncertain`.
 - O campo `class` do evento é inferido: 1 linha = `car`, 2 linhas = `motorcycle` (a confirmar com o TRA-1).
 - O nome do tópico (`ods.i7.plate_read`) segue o padrão `ods.<componente>.<evento>` dos tópicos já existentes (`ods.i1.detections`, `ods.i6.code_read`), e não os domínios sugeridos no guia (que lista `ods.veiculo.placa_lida` para o I7). A confirmar com o TRA-1.
-- O broker é temporário (Google Cloud, compartilhado); a versão final usará um broker local, e só o `KAFKA_BROKER` precisa mudar.
+- O broker é temporário (Jetson do Dcomp, compartilhado; antes, Google Cloud); a versão final usará um broker local, e só o `KAFKA_BROKER` precisa mudar.
