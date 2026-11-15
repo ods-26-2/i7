@@ -1,6 +1,7 @@
 """
 Pipeline ALPR Personalizado:
-1. Detecção e classificação de placas via YOLO próprio (4 classes)
+1. Detecção e classificação de placas via YOLO próprio (4 classes). DETECTOR="ultralytics" usa o best.pt;
+   DETECTOR="p2" usa o pacote do B5 (P2_ENGINE_REF, ex.: app-plates-1.0.0) carregado pela biblioteca P2.
 2. Mapeamento explícito de classes (1L/2L BR/ME)
 3. Pré-processamento de imagem no recorte (Escala de Cinza, CLAHE e Filtro Bilateral)
 4. OCR especializado via Fast-ALPR (DefaultOCR)
@@ -27,7 +28,6 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 from fast_alpr.default_ocr import DefaultOCR
-from ultralytics import YOLO
 
 from publicador_eventos import ConstrutorEventos, agora_utc, criar_publicador
 
@@ -39,6 +39,9 @@ load_dotenv(RAIZ / ".env")
 PASTAS_IMAGENS_BRUTO = os.getenv("PASTA_IMAGENS", "datasetConvertidoYOLO")
 PASTA_SAIDA = RAIZ / os.getenv("PASTA_SAIDA", "saidas")
 CAMINHO_MODELO_YOLO = RAIZ / os.getenv("CAMINHO_MODELO_YOLO", "modelos/modelo4classesV1/best.pt")
+# Detector de placas: "ultralytics" (best.pt, padrão) ou "p2" (biblioteca P2 com o pacote do B5).
+DETECTOR = os.getenv("DETECTOR", "ultralytics").strip().lower()
+P2_ENGINE_REF = os.getenv("P2_ENGINE_REF", "app-plates-1.0.0")   # <artifact_id>-<artifact_version> do B5
 
 
 
@@ -81,8 +84,7 @@ PUBLICACAO_MODO = os.getenv("PUBLICACAO_MODO", "arquivo")   # "arquivo", "kafka"
 # É independente do mínimo que o A8 usa para liberar a entrada (variável própria do A8); hoje os dois valem 0,9.
 LIMIAR_INCERTEZA = env_numero("LIMIAR_INCERTEZA", 0.9)
 SOURCE_ID = os.getenv("SOURCE_ID", "cam-entrada")           # câmera/portão de origem
-ARTIFACT_VERSION = os.getenv("ARTIFACT_VERSION") or (
-    f"{CAMINHO_MODELO_YOLO.parent.name}+{OCR_MODELO.removesuffix('-model')}")  # modelo + OCR usados
+ARTIFACT_VERSION_ENV = os.getenv("ARTIFACT_VERSION")   # se vazio, é montado em main() (detector + OCR)
 
 CONF_DETECCAO = 0.25
 MOSTRAR_JANELA = False
@@ -407,6 +409,8 @@ def validar_config_experimento() -> list[str]:
         erros.append(f"PRE_PROPORCAO deve ser 0 (desligado) ou estar entre 1 e 4 (recebi {PRE_PROPORCAO})")
     if not 0 <= PRE_NITIDEZ <= 3:
         erros.append(f"PRE_NITIDEZ deve estar entre 0 e 3 (recebi {PRE_NITIDEZ})")
+    if DETECTOR not in ("ultralytics", "p2"):
+        erros.append(f"DETECTOR deve ser 'ultralytics' ou 'p2' (recebi '{DETECTOR}')")
     if not OCR_MODELO.strip():
         erros.append("OCR_MODELO está vazio")
     return erros
@@ -418,7 +422,8 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "data_hora": datetime.now().isoformat(timespec="seconds"),
         "pasta_imagens": str(pasta),
         "limite": limite,
-        "modelo_yolo": str(CAMINHO_MODELO_YOLO),
+        "detector": DETECTOR,
+        "modelo_yolo": str(CAMINHO_MODELO_YOLO) if DETECTOR == "ultralytics" else P2_ENGINE_REF,
         "conf_deteccao": CONF_DETECCAO,
         "preprocessamento": PREPROCESSAMENTO,
         "margem_recorte_pct": MARGEM_RECORTE_PCT,
@@ -699,9 +704,26 @@ def main(limite: int | None = None):
         criar_publicador(PUBLICACAO_MODO, PASTA_SAIDA / "eventos.jsonl")
     except (ValueError, NotImplementedError) as erro:
         raise SystemExit(f"[ERRO] {erro}")
+
+    # Carrega o detector (uma vez, para todas as pastas). Com o P2, a versão do engine (info) é a
+    # que vai no artifact_version dos eventos.
+    if DETECTOR == "p2":
+        from detector_p2 import DetectorP2
+        try:
+            modelo_yolo = DetectorP2(P2_ENGINE_REF)
+        except Exception as erro:   # P2Error (ENGINE_NOT_FOUND, ...) ou P2 não instalado
+            raise SystemExit(f"[ERRO] Não foi possível carregar o engine '{P2_ENGINE_REF}' com o P2: {erro}")
+        versao_detector = modelo_yolo.versao
+        nome_detector = f"P2 ({versao_detector})"
+    else:
+        from ultralytics import YOLO
+        modelo_yolo = YOLO(CAMINHO_MODELO_YOLO)
+        versao_detector = CAMINHO_MODELO_YOLO.parent.name
+        nome_detector = "YOLO Próprio (ultralytics)"
+    ARTIFACT_VERSION = ARTIFACT_VERSION_ENV or f"{versao_detector}+{OCR_MODELO.removesuffix('-model')}"
     construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION)
 
-    print(f"Detector: YOLO Próprio | OCR: Fast-ALPR ({OCR_MODELO}) | {len(pastas)} pasta(s) de imagens")
+    print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {len(pastas)} pasta(s) de imagens")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
           + (f" (altura alvo {PRE_ALTURA_ALVO:g}px, nitidez {PRE_NITIDEZ:g}, proporção {PRE_PROPORCAO:g})"
              if PRE_ALTURA_ALVO or PRE_NITIDEZ or PRE_PROPORCAO else "") + " | "
@@ -716,15 +738,15 @@ def main(limite: int | None = None):
     for pasta, saida in zip(pastas, saidas):
         print(f"  {pasta}  ->  {saida}")
 
-    # 1. Carrega modelo YOLO treinado (uma vez, para todas as pastas)
-    modelo_yolo = YOLO(CAMINHO_MODELO_YOLO)
-
-    # 2. Inicializa o OCR (uma vez)
+    # Inicializa o OCR (uma vez)
     ocr = DefaultOCR(hub_ocr_model=OCR_MODELO)
 
     for pasta, saida in zip(pastas, saidas):
         if processar_pasta(pasta, saida, modelo_yolo, ocr, construtor, limite):
             break  # usuário pediu para sair
+
+    if DETECTOR == "p2":
+        modelo_yolo.release()   # libera o engine do P2
 
     if MOSTRAR_JANELA:  # em OpenCV "headless" esta chamada daria erro
         cv2.destroyAllWindows()
