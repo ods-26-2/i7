@@ -46,8 +46,8 @@ O **tópico** (`ods.i7.plate_read`), o **esquema** e a **`schema_version` 1.0** 
 | `uncertain` | `true` quando a validação de formato **corrigiu ou rejeitou** algum caractere | `true` quando a **menor confiança** fica abaixo de `LIMIAR_INCERTEZA` (padrão 0.9). **Ainda não marcamos correções do formato**; leituras com formato inválido são rejeitadas e **não geram evento** |
 | `detection_id` | Detecção de **veículo** do I1 à qual a placa pertence (opcional, quando o I1 está na build) | Sem I1 na build: é só o **índice da placa no quadro** (0, 1, 2…). Passa a ter o sentido da 6c quando houver acompanhamento/votação |
 | `class` | Vocabulário do I1 (`car`, `motorcycle`) | Mesmos valores, **inferidos** pelo número de linhas da placa (1 = `car`, 2 = `motorcycle`) |
-| `frame_index` | Quadro do stream `ods.p4.frame` | Posição da imagem dentro da pasta processada (a stream de P4 ainda não está disponível) |
-| `bbox` | Placa no quadro de P4 | Placa na imagem de entrada, em pixels (a stream de P4 ainda não está disponível) |
+| `frame_index` | Quadro do stream `ods.p4.frame` | Com vídeo (`--video`): o **número do quadro** no arquivo de vídeo. Com pasta de imagens: a posição da imagem na pasta (a stream de P4 ainda não está disponível) |
+| `bbox` | Placa no quadro de P4 | Placa na imagem ou no quadro de vídeo de entrada, em pixels (a stream de P4 ainda não está disponível) |
 | `license_plate`, `plate_layout` | 7 caracteres; `OLD_BR` ou `MERCOSUL` | Iguais |
 
 Diferenças no envelope e na origem dos dados:
@@ -55,7 +55,7 @@ Diferenças no envelope e na origem dos dados:
 - `artifact_version`: a 6c exemplifica `lpr-br-2.1.0`; usamos `<detector>+<modelo de OCR>` (configurável por `ARTIFACT_VERSION`). Com `DETECTOR=p2`, a parte do detector é a versão que o P2 informa (`app-plates-1.0.0-fp32`); com `DETECTOR=ultralytics` (padrão), é o nome da pasta do `best.pt`. O OCR (`cct-s-v2-global`) não está no registro de B5 e não passa pelo P2.
 - `occurred_at`: **campo acrescentado ao envelope**, que não consta na 6c (ela usa `captured_at` e `published_at`). O guia do Kafka B2 o lista como campo **obrigatório** (`CAMPOS_OBRIGATORIOS`), e um consumidor no padrão do guia descarta a mensagem sem ele. Para o I7 é o mesmo instante de `captured_at` (quando o veículo foi visto), então os dois têm o mesmo valor. O `schema_version` continua `1.0`, pois o payload segue a 6c.
 - `session_id`: o I7 cria uma sessão por execução. A 6c prevê `ods.session.started` publicado por P4, P5 e P6; como a stream de P4 ainda não está disponível, não consumimos nem publicamos esse marcador.
-- O I7 lê **imagens do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame`; usamos imagens do disco porque a stream de P4 ainda não está disponível.
+- O I7 lê **imagens ou vídeos do disco** (YOLO + OCR). Na 6c ele consome `ods.p4.frame`; usamos arquivos porque a stream de P4 ainda não está disponível. No vídeo, o I7 processa alguns quadros por segundo e, para não publicar a mesma placa dezenas de vezes, só publica leituras com confiança mínima >= 0,9 e não repete a mesma placa dentro de 10 s (tempo do vídeo). Isso não está na 6c, que prevê o acompanhamento do veículo entre quadros; fazemos tudo dentro do I7, sem consumir outros componentes.
 - **P2 e B5:** na 6c o modelo vem do registro de B5 e é carregado pela biblioteca P2. O pacote `app-plates` 1.0.0 (B5/MOD-1) já está no projeto e é o detector recomendado no `.env.example` (`DETECTOR=p2`); o `best.pt` pela ultralytics continua disponível (`DETECTOR=ultralytics`) e os dois arquivos de pesos são idênticos (mesmo SHA-256). Em 200 imagens, os dois acertaram 167 (83,5%), e o P2 foi mais rápido (1 min 55 s contra 3 min 59 s). Na Jetson, o P2 compila o mesmo pacote em TensorRT FP16; aqui, no Docker, roda em CPU. Não consumimos ainda o aviso `ods.artifact.published`: a versão é fixada na construção da imagem.
 - Como na 6c, o I7 **não grava evidência própria**.
 
@@ -67,11 +67,12 @@ Do lado do A8, o `uncertain` **ainda não é usado**: a decisão usa a `confiden
 
 1. Copie `.env.example` para `.env` e ajuste os caminhos. O `.env` **não vai para o git**.
 2. Teste sem broker: `PUBLICACAO_MODO=arquivo` e rode `python scripts/aplicacaoModelov5-fast+rodosol.py -n 2`. Os eventos ficam em `saidas/<pasta>/eventos.jsonl`.
+   Com vídeo: `python scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4` (trecho opcional com `--inicio 1:30 --fim 2:10`). Para baixar um vídeo: `python scripts/baixar_video.py "<link>" --nome portao`. Detalhes no `README.md`, seção "Vídeo".
 3. Para publicar de verdade: `PUBLICACAO_MODO=kafka` e, na primeira vez, `python scripts/publicador_eventos.py --criar-topico`.
 4. Para conferir o que chegou ao broker: `python scripts/consumidor_teste.py --max 60`. Opções: `--novas` (só o que ainda não leu; grava a posição num `group.id` próprio) e `--ao-vivo` (só o que chegar com ele ligado). Nenhuma usa o `group.id` do A8.
 5. Broker da Jetson: dentro do Dcomp, `KAFKA_BROKER=172.18.4.56:9092`; de fora, `200.17.66.56:9092`. Como o broker anuncia `localhost:9092`, é preciso uma ponte `socat` e rodar o container com `--network container:ponte` (passo a passo no `README.md`, seção "Acesso ao broker da Jetson").
 
-> O broker é **temporário e compartilhado** (gasta créditos do projeto). Use sempre `-n` pequeno e não deixe processos rodando em laço.
+> O broker é **temporário e compartilhado** por todas as squads. Use sempre `-n` pequeno (ou um trecho curto de vídeo) e não deixe processos rodando em laço.
 
 ### Lado A8 (aplicação)
 
@@ -87,7 +88,9 @@ Variáveis do A8: `KAFKA_ATIVO`, `KAFKA_BROKER`, `KAFKA_TOPICO`, `KAFKA_GROUP_ID
 - Passar a consumir a stream `ods.p4.frame` quando ela estiver disponível.
 - Confirmar o `DETECTOR=p2` nas 800 imagens (a comparação feita foi com 200) e rodar o P2 na Jetson (TensorRT FP16, com SIS-1 e a imagem base de P3). O OCR continua fora do P2, por decisão do squad.
 - Fazer o `uncertain` também marcar caracteres corrigidos pela validação de formato (como na 6c).
-- Acompanhar a mesma placa entre frames (votação) e dar ao `detection_id` o sentido da 6c.
+- Acompanhar a mesma placa entre frames (votação) e dar ao `detection_id` o sentido da 6c. Hoje, no vídeo, leituras diferentes do mesmo carro (ex.: `OVK7900` e `OVK79O0`) contam como placas diferentes; a confiança mínima de 0,9 reduz, mas não elimina, esse caso.
+- Medir `NMS_ENTRE_CLASSES=sim` (recomendado no `.env.example`) nas 800 imagens.
+- Placas coloridas (comerciais, oficiais etc.) podem não ser detectadas: o detector foi treinado quase só com placas cinza e Mercosul de carro particular.
 - Incluir o CNPJ no evento e filtrar por empresa no A8 (hoje a placa é procurada em qualquer empresa).
 - Pedir a correção do `advertised.listeners` da Jetson (hoje anuncia `localhost:9092`), o que dispensa a ponte `socat` no I7 e no A8.
 - Trocar o broker temporário por um broker local.

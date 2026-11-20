@@ -16,11 +16,12 @@ if (-not (Test-Path .env)) {
     exit 1
 }
 
-New-Item -ItemType Directory -Force saidas, datasetConvertidoYOLO | Out-Null
+New-Item -ItemType Directory -Force saidas, datasetConvertidoYOLO, videos | Out-Null
 
 docker run --rm --env-file .env `
     -v "${PWD}/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" `
     -v "${PWD}/saidas:/app/saidas" `
+    -v "${PWD}/videos:/app/videos" `
     -v i7-ocr-cache:/root/.cache/fast-plate-ocr `
     $Imagem @args
 exit $LASTEXITCODE

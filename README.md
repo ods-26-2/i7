@@ -9,10 +9,11 @@ Componente de **reconhecimento automático de placas** para controle de acesso v
 ## Fluxo
 
 ```
-imagem → detector YOLO (4 classes) → recorte (+ margem nas Mercosul) → OCR (cct-s-v2-global)
+imagem (pasta) ou quadro de vídeo (--video, N quadros por segundo)
+       → detector YOLO (4 classes) → recorte (+ margem nas Mercosul) → OCR (cct-s-v2-global)
        → correção posicional + regex → resultado
                                          ├─ mosaico + resultados.csv
-                                         └─ evento ods.i7.plate_read
+                                         └─ evento ods.i7.plate_read (no vídeo: só confiança >= 0,9 e sem repetir a placa)
                                               ├─ modo arquivo: eventos.jsonl (sem rede)
                                               └─ modo kafka:   tópico ods.i7.plate_read no broker
 ```
@@ -60,7 +61,8 @@ curl -L -o "$d/cct_s_v2_global_plate_config.yaml" "$base/cct_s_v2_global_plate_c
 
 | Arquivo | Função |
 |---|---|
-| `aplicacaoModelov5-fast+rodosol.py` | **Pipeline atual:** YOLO de 4 classes + OCR + validação, com mosaicos, CSV e publicação de eventos |
+| `aplicacaoModelov5-fast+rodosol.py` | **Pipeline atual:** YOLO de 4 classes + OCR + validação, com mosaicos, CSV e publicação de eventos. Lê pastas de imagens ou um vídeo (`--video`) |
+| `baixar_video.py` | Baixa um vídeo (ex.: do YouTube, com `yt-dlp`) para a pasta `videos/`, para depois rodar o pipeline com `--video` |
 | `publicador_eventos.py` | Monta e valida o evento `ods.i7.plate_read` (envelope da Arquitetura 6c + guia do Kafka) e o publica (arquivo, Kafka ou nada). Também funciona sozinho: `--exemplo`, `--validar` e `--criar-topico` |
 | `consumidor_teste.py` | Lê o tópico e valida cada evento como um consumidor faria (guia do Kafka, seções 4.2 e 4.3). Serve para conferir o que foi publicado. Modos: sem opção (relê tudo), `--novas` (só o que ainda não leu) e `--ao-vivo` (só o que chegar com ele ligado) |
 | `comprovacaoAcertos.py` | Compara o `resultados.csv` com a placa verdadeira: acertos, erros por posição, confiança. `--comparar` põe experimentos lado a lado |
@@ -91,6 +93,7 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `CAMINHO_MODELO_YOLO` | `modelos/modelo4classesV1/best.pt` | idem | Modelo de detecção |
 | `DETECTOR` | `ultralytics` | **`p2`** (ou `ultralytics`, ver abaixo) | `ultralytics` usa o `best.pt`; `p2` usa o pacote do B5 pela biblioteca P2 |
 | `P2_ENGINE_REF` | `app-plates-1.0.0` | idem | Engine do P2 (só com `DETECTOR=p2`) |
+| `NMS_ENTRE_CLASSES` | `nao` | **`sim`** | Com `sim`, caixas sobrepostas de classes diferentes se eliminam (fica a de maior confiança): evita a mesma placa detectada duas vezes, como antiga e como Mercosul. Testado em vídeo; falta medir nas 800 imagens |
 | `OCR_MODELO` | `global-plates-mobile-vit-v2-model` | **`cct-s-v2-global-model`** | Modelo de OCR |
 | `MARGEM_RECORTE_MERCOSUL_PCT` | vazio (usa a geral) | **`10`** | Margem (% da caixa) só nas placas Mercosul |
 | `MARGEM_RECORTE_PCT` | `0` | `0` | Margem para as demais placas |
@@ -99,6 +102,9 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `SOURCE_ID` | `cam-entrada` | `cam-entrada` | Câmera/portão de origem do evento |
 | `ARTIFACT_VERSION` | detector + OCR | opcional | Versão do artefato no evento (com `DETECTOR=p2`: `app-plates-1.0.0-fp32+cct-s-v2-global`) |
 | `LIMIAR_INCERTEZA` | `0.9` | `0.9` | Se a menor confiança entre os caracteres ficar abaixo disso, o evento sai com `uncertain: true` |
+| `VIDEO_QUADROS_POR_SEGUNDO` | `2` | `2` | Só com `--video`: quadros processados por segundo do vídeo (os outros são pulados) |
+| `VIDEO_JANELA_REPETICAO_S` | `10` | `10` | Só com `--video`: a mesma placa só volta a ser publicada depois de ficar esse tempo (do vídeo) sem ser lida |
+| `VIDEO_CONFIANCA_MINIMA` | `LIMIAR_INCERTEZA` (0.9) | `0.9` | Só com `--video`: só vira evento a leitura com confiança mínima >= este valor. `0` publica todas |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
 | `KAFKA_BROKER` | `172.18.4.56:9092` | `172.18.4.56:9092` (dentro do Dcomp) ou `200.17.66.56:9092` (fora) | Endereço do broker da Jetson (temporário); na versão final será local. Ver "Acesso ao broker da Jetson" |
 
@@ -120,6 +126,26 @@ python scripts/comprovacaoAcertos.py --comparar saidas/exp_a saidas/exp_b
 ```
 
 Para comparar configurações, rode o pipeline uma vez para cada uma, cada qual com seu `PASTA_SAIDA`. Rode sobre as pastas `images/<split>` do dataset convertido, para os nomes dos arquivos baterem com o `split_manifest.csv`. Use `val` para decidir e `test` só para o número final.
+
+### Vídeo
+
+```bash
+# baixa um vídeo para videos/ (só a imagem, até 1080p; --altura-max 720 para arquivos menores)
+python scripts/baixar_video.py "https://www.youtube.com/watch?v=..." --nome portao
+
+# processa o vídeo inteiro, ou só um trecho (segundos ou minutos:segundos)
+python scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4
+python scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4 --inicio 1:30 --fim 2:10
+```
+
+- **Amostragem:** processa `VIDEO_QUADROS_POR_SEGUNDO` quadros por segundo do vídeo (padrão 2, o ritmo do pipeline na CPU). Num vídeo a 30 q/s, 1 a cada 15 quadros. O `-n N` limita aos N primeiros quadros amostrados.
+- **Uma leitura por veículo:** a mesma placa só volta a ser publicada depois de ficar `VIDEO_JANELA_REPETICAO_S` segundos (padrão 10, tempo do vídeo) sem ser lida; cada nova leitura reinicia a contagem, então um carro parado no portão gera um evento só. A janela é por texto de placa: placas diferentes são publicadas normalmente, mesmo no mesmo quadro.
+- **Só leituras confiáveis:** no vídeo, só vira evento a leitura com confiança mínima >= `VIDEO_CONFIANCA_MINIMA` (padrão 0,9). Um carro que se aproxima começa borrado; as leituras ruins do começo ficam só no CSV e a leitura nítida dos quadros seguintes é a publicada. Nas imagens nada muda: toda leitura aceita vira evento (com `uncertain` abaixo de 0,9).
+- **Saída** em `PASTA_SAIDA/<nome do vídeo>` (com trecho: `<nome>_90-130s`). O `resultados.csv` tem uma linha por leitura, com `quadro`, `tempo_s` e `publicado` (`sim`, `repetida`, `baixa_confianca` ou vazio, quando a validação recusou). Só os quadros com placa geram mosaico.
+- O `frame_index` do evento é o número real do quadro no vídeo, e o `captured_at` é a hora em que o quadro foi lido (o arquivo não guarda a hora da gravação).
+- Vídeos ficam na pasta `videos/`, que não vai para o Git. Baixar do YouTube pode ferir os termos do site: use para testes e com vídeos que vocês possam usar. Se o `yt-dlp` falhar, coloque o arquivo em `videos/` por outro meio.
+
+Testes com vídeos de demonstração de câmeras LPR (placas brasileiras): as placas nítidas foram lidas corretamente e publicadas uma vez cada; as leituras erradas de placas ainda distantes ficaram abaixo de 0,9 e não viraram evento.
 
 ## Publicação de eventos (Kafka)
 
@@ -185,6 +211,7 @@ docker run --rm --name ponte alpine/socat TCP-LISTEN:9092,fork,reuseaddr TCP:<ip
 docker run --rm --env-file .env --network container:ponte \
   -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
   -v "$(pwd)/saidas:/app/saidas" \
+  -v "$(pwd)/videos:/app/videos" \
   -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
   parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 2
 
@@ -207,7 +234,7 @@ Se o `docker network` do seu computador (por exemplo, a rede `a8_default` do Com
 ## Saídas (em cada pasta de saída)
 
 - `<imagem>_mosaico.jpg`: imagem com a detecção, o recorte que o OCR viu e o texto lido.
-- `resultados.csv`: imagem, placa lida, tipo, confiança da detecção, confiança média do OCR, **texto bruto do OCR**, confiança mínima e confiança por caractere.
+- `resultados.csv`: imagem, placa lida, tipo, confiança da detecção, confiança média do OCR, **texto bruto do OCR**, confiança mínima e confiança por caractere. No vídeo, `quadro` e `tempo_s` no lugar de `imagem`, mais a coluna `publicado`.
 - `eventos.jsonl`: um evento `ods.i7.plate_read` por leitura aceita pela validação (só no modo `arquivo`).
 - `experimento.json`: a configuração usada na execução.
 - Pelo `comprovacaoAcertos.py`: `acertos_detalhado.csv` (placa real × lida por imagem), `dashboard_acertos.png` e, com `--comparar`, `comparacao_experimentos.csv`.
@@ -223,12 +250,16 @@ Todos os números são de acertos exatos contra a placa verdadeira.
 | + margem de 10% em todas as placas | 81,5% (piora as antigas) |
 | **+ margem de 10% só nas Mercosul** | **82,0%** |
 | Medição final, 800 imagens de `test` | **84,0%** |
+| Recusar leituras com mais de 7 caracteres (antes eram cortadas), simulado nas 800 | acertos iguais; 4 placas erradas deixam de ser aceitas (106 → 102) |
 
 Testados e descartados (80 imagens de `test`): remover o pré-processamento (59 → 56 acertos com o OCR novo; sem efeito com o antigo), "dobrar" a placa de moto em uma linha (ajudou o OCR antigo, 47 → 52, mas piorou o novo, 59 → 48), folga no corte e descarte da faixa "BRASIL" (sem ganho).
 
 ## Observações e limitações
 
 - O formato válido da placa não garante leitura correta: a regex pode aprovar uma leitura errada. Por isso a avaliação compara com a placa verdadeira.
+- Leituras com mais de 7 caracteres são recusadas (antes eram cortadas para 7 e podiam virar uma placa brasileira válida, mas errada; por exemplo, uma placa estrangeira `34A36837` virava `BAA6837`).
+- **Placas coloridas:** o detector foi treinado com o RodoSol, quase só placas cinza (antigas) e Mercosul de carro particular. Placas vermelhas (comerciais, aluguel), pretas, azuis ou Mercosul com letras coloridas podem não ser detectadas; os 84% não dizem nada sobre elas. Melhorar isso exigiria treinar o detector com esses exemplos.
+- Fora do RodoSol (câmera fixa e boa luz), a qualidade depende da câmera: placas pequenas, distantes ou borradas no vídeo geram leituras erradas, que a confiança mínima de 0,9 costuma barrar.
 - O erro mais comum é a primeira letra: `O` lido como `D` (15 casos em 800).
 - Os scripts de treino dos modelos YOLO (e a geração dos rótulos por classe) não estão neste repositório. O `converterDataset-YOLO.py` gera apenas a classe `plate`.
 - `detection_id` é, por ora, apenas o índice da detecção no frame; não acompanha o mesmo veículo entre frames (previsto para quando houver tracking/votação).

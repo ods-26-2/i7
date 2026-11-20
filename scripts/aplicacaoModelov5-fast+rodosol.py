@@ -13,6 +13,8 @@ Pipeline ALPR Personalizado:
 8. Experimentos de OCR controlados pelo .env (todos neutros por padrão): PREPROCESSAMENTO,
    MARGEM_RECORTE_PCT, DOBRAR_2L, DOBRAR_DIVISAO_PCT, OCR_MODELO. Cada execução grava um
    experimento.json com a configuração usada, e o resultados.csv inclui o texto BRUTO do OCR.
+9. Vídeo (--video arquivo.mp4, trecho opcional com --inicio/--fim): processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo do vídeo
+   e não republica a mesma placa enquanto ela continuar sendo lida (janela VIDEO_JANELA_REPETICAO_S).
 """
 import argparse
 import csv
@@ -86,7 +88,20 @@ LIMIAR_INCERTEZA = env_numero("LIMIAR_INCERTEZA", 0.9)
 SOURCE_ID = os.getenv("SOURCE_ID", "cam-entrada")           # câmera/portão de origem
 ARTIFACT_VERSION_ENV = os.getenv("ARTIFACT_VERSION")   # se vazio, é montado em main() (detector + OCR)
 
+# --- Vídeo (--video) ---
+VIDEO_QUADROS_POR_SEGUNDO = env_numero("VIDEO_QUADROS_POR_SEGUNDO", 2)   # quadros processados por segundo DO VÍDEO
+VIDEO_JANELA_REPETICAO_S = env_numero("VIDEO_JANELA_REPETICAO_S", 10)    # a mesma placa só volta a ser publicada
+                                                                         # depois de ficar este tempo (do vídeo) sem ser lida
+# No vídeo, só vira evento a leitura com confiança mínima >= este valor (padrão: LIMIAR_INCERTEZA). As de baixa
+# confiança ficam só no CSV; a leitura nítida que costuma vir nos quadros seguintes é a publicada. 0 = desliga.
+VIDEO_CONFIANCA_MINIMA = env_numero("VIDEO_CONFIANCA_MINIMA", LIMIAR_INCERTEZA)
+EXTENSOES_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
 CONF_DETECCAO = 0.25
+# Supressão de caixas sobrepostas também entre classes diferentes (sim | nao). Com "nao" (padrão da
+# ultralytics), a mesma placa pode sair duas vezes, como "antiga" e como "Mercosul"; com "sim", fica só a
+# caixa de maior confiança. Vale para os dois detectores (ultralytics: agnostic_nms; P2: detector_p2.py).
+NMS_ENTRE_CLASSES = env_sim_nao("NMS_ENTRE_CLASSES", "nao")
 MOSTRAR_JANELA = False
 ALTURA_MOSAICO = 640
 LARGURA_PAINEL = 420
@@ -169,16 +184,13 @@ def pre_processar_recorte_ocr(crop: np.ndarray) -> np.ndarray:
 
 
 def forcar_sete_caracteres(texto: str) -> str:
-    """Garante uma string de exatamente 7 caracteres descartando ruídos no meio."""
-    if len(texto) == 7:
-        return texto
-
-    if len(texto) > 7:
-        candidato_sem_meio = texto[:3] + texto[4:]
-        if len(candidato_sem_meio) == 7:
-            return candidato_sem_meio
-        return texto[:7]
-
+    """
+    Devolve o texto como está. Leituras com mais (ou menos) de 7 caracteres NÃO são cortadas: elas
+    seguem com o tamanho original e são recusadas pela validação de formato.
+    Antes, uma leitura de 8 caracteres perdia um caractere e podia virar uma placa brasileira válida,
+    mas errada (ex.: a placa estrangeira 34A36837 virava BAA6837). Nas 800 imagens de teste, as 5
+    leituras com mais de 7 caracteres estavam todas erradas (4 delas eram aceitas depois do corte).
+    """
     return texto
 
 
@@ -425,6 +437,7 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "detector": DETECTOR,
         "modelo_yolo": str(CAMINHO_MODELO_YOLO) if DETECTOR == "ultralytics" else P2_ENGINE_REF,
         "conf_deteccao": CONF_DETECCAO,
+        "nms_entre_classes": NMS_ENTRE_CLASSES,
         "preprocessamento": PREPROCESSAMENTO,
         "margem_recorte_pct": MARGEM_RECORTE_PCT,
         "margem_recorte_mercosul_pct": MARGEM_RECORTE_MERCOSUL_PCT,
@@ -436,6 +449,9 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "pre_altura_alvo": PRE_ALTURA_ALVO,
         "pre_nitidez": PRE_NITIDEZ,
         "pre_proporcao": PRE_PROPORCAO,
+        "video_quadros_por_segundo": VIDEO_QUADROS_POR_SEGUNDO,
+        "video_janela_repeticao_s": VIDEO_JANELA_REPETICAO_S,
+        "video_confianca_minima": VIDEO_CONFIANCA_MINIMA,
     }
 
 
@@ -536,6 +552,112 @@ def rotulos_das_pastas(pastas: list[Path]) -> list[str]:
 
 
 # ------------------------------- MAIN ----------------------------------
+def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo, ocr,
+                     construtor: ConstrutorEventos, publicador, decidir_publicacao=None):
+    """
+    Roda o pipeline em UMA imagem já aberta (de uma pasta ou, futuramente, um quadro de vídeo):
+    detecção, recorte, OCR e validação, e publica um evento por leitura aceita.
+    `nome` só aparece nas mensagens; `frame_index` e `capturado_em` vão para o evento.
+    `decidir_publicacao(placa, conf_min)`, se informado, decide se uma leitura aceita vira evento
+    (no vídeo: "sim", "repetida" ou "baixa_confianca"). Devolve (caixas, crops, resultados, extras,
+    publicacao), usados no mosaico e no resultados.csv. `publicacao`, por leitura: "sim", o motivo
+    de não ter sido publicada ou "" (leitura recusada pela validação ou publicação desligada).
+    """
+    # Inferencia no detector YOLO
+    yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False,
+                                       agnostic_nms=NMS_ENTRE_CLASSES)[0]
+
+    caixas = []
+    crops = []
+    resultados = []
+    extras = []  # por placa, alinhada às listas acima: (texto bruto, confiança mínima, confianças)
+    publicacao = []  # por placa: "sim" (evento gerado), "repetida", "baixa_confianca" ou ""
+
+    for indice_deteccao, box in enumerate(yolo_results.boxes):
+        conf_det = float(box.conf[0])
+        cls_id = int(box.cls[0])
+        nome_classe_raw = modelo_yolo.names[cls_id]
+
+        # Mapeia para o nome formatado usando o dicionário NOMES_CLASSES
+        rotulo_classe = NOMES_CLASSES.get(nome_classe_raw, nome_classe_raw)
+
+        # Extrai coordenadas Bounding Box
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+        # Recorte da placa (com a margem do experimento; 0% = exatamente a caixa do YOLO)
+        cx1, cy1, cx2, cy2 = expandir_caixa(x1, y1, x2, y2, img.shape[1], img.shape[0],
+                                            margem_para_classe(nome_classe_raw))
+        crop_original = img[cy1:cy2, cx1:cx2]
+        if crop_original.size == 0:
+            continue
+
+        # Experimento: placa de 2 linhas "dobrada" em uma linha larga
+        entrada_ocr = crop_original
+        linhas_2l = None
+        if DOBRAR_2L != "nao" and nome_classe_raw.startswith("placa_2L"):
+            if DOBRAR_2L == "separar":
+                # lê cada linha sozinha (corte automático pelo vale entre as linhas)
+                linhas_2l = cortar_linhas_placa(crop_original, "auto", DOBRAR_DIVISAO_PCT,
+                                                DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
+            # no mosaico: a placa "dobrada" (no modo separar, só para ver onde foi o corte)
+            entrada_ocr = dobrar_placa_2_linhas(crop_original, "auto" if DOBRAR_2L == "separar" else DOBRAR_2L,
+                                                DOBRAR_DIVISAO_PCT, DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
+
+        # Pré-processamento antes da chamada do OCR (pode ser desligado: PREPROCESSAMENTO=nao)
+        preprocessar = pre_processar_recorte_ocr if PREPROCESSAMENTO else (lambda im: im)
+
+        # OCR: uma imagem só (padrão, dobrada ou não) ou cada linha separadamente
+        if linhas_2l is not None:
+            ocr_result = ler_placa_2_linhas(ocr, linhas_2l, preprocessar)
+        else:
+            ocr_result = ocr.predict(preprocessar(entrada_ocr))
+
+        texto_ocr = ""
+        conf_ocr = 0.0
+        conf_min = 0.0
+        confs_txt = ""
+
+        if ocr_result:
+            texto_ocr = ocr_result.text            # texto BRUTO, antes de qualquer correção
+            conf_ocr = normalizar_confianca_ocr(ocr_result.confidence)
+            conf_min = confianca_minima(ocr_result.confidence)
+            confs_txt = formatar_confiancas(ocr_result.confidence)
+
+        # Tratamento e validação de regras com base no rótulo mapeado
+        placa_validada, status_tipo = processar_leitura(texto_ocr, rotulo_classe)
+
+        publicado = ""
+        # Evento ods.i7.plate_read, só para leituras ACEITAS pela validação
+        # (processar_leitura devolve o rótulo da classe sem sufixo quando a placa é válida).
+        if (publicador.ativo and status_tipo == rotulo_classe
+                and nome_classe_raw in CLASSES_PARA_CONTRATO):
+            layout_placa, classe_veiculo = CLASSES_PARA_CONTRATO[nome_classe_raw]
+            confs_7 = confiancas_dos_7_caracteres(texto_ocr, ocr_result.confidence if ocr_result else None)
+            if confs_7 is None:
+                print(f"[PUBLICAÇÃO] {nome}: sem confiança por caractere alinhada; evento não publicado")
+            elif decidir_publicacao is not None and \
+                    (decisao := decidir_publicacao(placa_validada, conf_min)) != "sim":
+                publicado = decisao
+            else:
+                publicado = "sim"
+                publicador.publicar(construtor.plate_read(
+                    placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
+                    confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
+                    character_confidences=confs_7,
+                    uncertain=conf_min < LIMIAR_INCERTEZA,
+                    bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=frame_index,
+                    detection_id=indice_deteccao,  # GENÉRICO: índice da detecção no quadro (não acompanha o veículo)
+                    captured_at=capturado_em))
+
+        caixas.append((x1, y1, x2, y2, conf_det, status_tipo))
+        crops.append(entrada_ocr)  # no mosaico: o que o OCR "viu" (com margem / dobrada, se for o caso)
+        resultados.append((placa_validada, conf_ocr, status_tipo, conf_det))
+        extras.append((texto_ocr, conf_min, confs_txt))
+        publicacao.append(publicado)
+
+    return caixas, crops, resultados, extras, publicacao
+
+
 def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
                     limite: int | None = None) -> bool:
     """
@@ -573,89 +695,8 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
                 continue
             capturado_em = agora_utc()  # instante da captura (aqui: leitura da imagem do disco)
 
-            # Inferencia no detector YOLO
-            yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False)[0]
-
-            caixas = []
-            crops = []
-            resultados = []
-            extras = []  # por placa, alinhada às listas acima: (texto bruto, confiança mínima, confianças)
-
-            for indice_deteccao, box in enumerate(yolo_results.boxes):
-                conf_det = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                nome_classe_raw = modelo_yolo.names[cls_id]
-
-                # Mapeia para o nome formatado usando o dicionário NOMES_CLASSES
-                rotulo_classe = NOMES_CLASSES.get(nome_classe_raw, nome_classe_raw)
-
-                # Extrai coordenadas Bounding Box
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-
-                # Recorte da placa (com a margem do experimento; 0% = exatamente a caixa do YOLO)
-                cx1, cy1, cx2, cy2 = expandir_caixa(x1, y1, x2, y2, img.shape[1], img.shape[0],
-                                                    margem_para_classe(nome_classe_raw))
-                crop_original = img[cy1:cy2, cx1:cx2]
-                if crop_original.size == 0:
-                    continue
-
-                # Experimento: placa de 2 linhas "dobrada" em uma linha larga
-                entrada_ocr = crop_original
-                linhas_2l = None
-                if DOBRAR_2L != "nao" and nome_classe_raw.startswith("placa_2L"):
-                    if DOBRAR_2L == "separar":
-                        # lê cada linha sozinha (corte automático pelo vale entre as linhas)
-                        linhas_2l = cortar_linhas_placa(crop_original, "auto", DOBRAR_DIVISAO_PCT,
-                                                        DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
-                    # no mosaico: a placa "dobrada" (no modo separar, só para ver onde foi o corte)
-                    entrada_ocr = dobrar_placa_2_linhas(crop_original, "auto" if DOBRAR_2L == "separar" else DOBRAR_2L,
-                                                        DOBRAR_DIVISAO_PCT, DOBRAR_FOLGA_PCT, DOBRAR_DESCARTE_TOPO_PCT)
-
-                # Pré-processamento antes da chamada do OCR (pode ser desligado: PREPROCESSAMENTO=nao)
-                preprocessar = pre_processar_recorte_ocr if PREPROCESSAMENTO else (lambda im: im)
-
-                # OCR: uma imagem só (padrão, dobrada ou não) ou cada linha separadamente
-                if linhas_2l is not None:
-                    ocr_result = ler_placa_2_linhas(ocr, linhas_2l, preprocessar)
-                else:
-                    ocr_result = ocr.predict(preprocessar(entrada_ocr))
-
-                texto_ocr = ""
-                conf_ocr = 0.0
-                conf_min = 0.0
-                confs_txt = ""
-
-                if ocr_result:
-                    texto_ocr = ocr_result.text            # texto BRUTO, antes de qualquer correção
-                    conf_ocr = normalizar_confianca_ocr(ocr_result.confidence)
-                    conf_min = confianca_minima(ocr_result.confidence)
-                    confs_txt = formatar_confiancas(ocr_result.confidence)
-
-                # Tratamento e validação de regras com base no rótulo mapeado
-                placa_validada, status_tipo = processar_leitura(texto_ocr, rotulo_classe)
-
-                # Evento ods.i7.plate_read, só para leituras ACEITAS pela validação
-                # (processar_leitura devolve o rótulo da classe sem sufixo quando a placa é válida).
-                if (publicador.ativo and status_tipo == rotulo_classe
-                        and nome_classe_raw in CLASSES_PARA_CONTRATO):
-                    layout_placa, classe_veiculo = CLASSES_PARA_CONTRATO[nome_classe_raw]
-                    confs_7 = confiancas_dos_7_caracteres(texto_ocr, ocr_result.confidence if ocr_result else None)
-                    if confs_7 is None:
-                        print(f"[PUBLICAÇÃO] {caminho.name}: sem confiança por caractere alinhada; evento não publicado")
-                    else:
-                        publicador.publicar(construtor.plate_read(
-                            placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
-                            confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
-                            character_confidences=confs_7,
-                            uncertain=conf_min < LIMIAR_INCERTEZA,
-                            bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=i - 1,
-                            detection_id=indice_deteccao,  # GENÉRICO: índice da detecção no quadro (não acompanha o veículo)
-                            captured_at=capturado_em))
-
-                caixas.append((x1, y1, x2, y2, conf_det, status_tipo))
-                crops.append(entrada_ocr)  # no mosaico: o que o OCR "viu" (com margem / dobrada, se for o caso)
-                resultados.append((placa_validada, conf_ocr, status_tipo, conf_det))
-                extras.append((texto_ocr, conf_min, confs_txt))
+            caixas, crops, resultados, extras, _ = processar_quadro(
+                img, caminho.name, i - 1, capturado_em, modelo_yolo, ocr, construtor, publicador)
 
             mosaico = juntar(desenhar_deteccoes(img, caixas),
                              montar_painel(crops, resultados))
@@ -680,9 +721,138 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
     return interrompido
 
 
-def main(limite: int | None = None):
-    pastas = listar_pastas(PASTAS_IMAGENS_BRUTO)
-    if not pastas:
+def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
+                    limite: int | None = None, inicio: float = 0.0, fim: float | None = None):
+    """
+    Roda o pipeline em um arquivo de vídeo. Processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo
+    do vídeo (os outros são pulados) e grava em `saida`: resultados.csv (uma linha por leitura,
+    com o quadro e o tempo), mosaicos só dos quadros com placa e, conforme PUBLICACAO_MODO, os eventos.
+    O `frame_index` do evento é o número do quadro no vídeo (a partir de 0).
+    Só vira evento a leitura com confiança mínima >= VIDEO_CONFIANCA_MINIMA (as outras aparecem no CSV
+    como "baixa_confianca"). A mesma placa só volta a ser publicada depois de ficar
+    VIDEO_JANELA_REPETICAO_S segundos (tempo do vídeo) sem ser lida; as leituras barradas aparecem no
+    CSV como "repetida".
+    Com `limite`, processa só os N primeiros quadros amostrados. Com `inicio`/`fim` (segundos do
+    vídeo), processa só esse trecho; o número do quadro e o tempo continuam os do vídeo inteiro.
+    """
+    video = cv2.VideoCapture(str(caminho))
+    if not video.isOpened():
+        print(f"[!] Não foi possível abrir o vídeo {caminho}")
+        return
+    fps = video.get(cv2.CAP_PROP_FPS) or 0
+    if fps <= 0 or math.isnan(fps):
+        fps = 30.0
+        print("[!] O vídeo não informa os quadros por segundo; usando 30.")
+    total = int(video.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    passo = max(1, round(fps / VIDEO_QUADROS_POR_SEGUNDO))
+    primeiro = round(inicio * fps)                               # primeiro quadro do trecho
+    ultimo = math.floor(fim * fps) if fim is not None else None  # último quadro do trecho (incluído)
+    if total and primeiro >= total:
+        print(f"[!] --inicio ({inicio:g} s) está depois do fim do vídeo ({total / fps:.1f} s).")
+        video.release()
+        return
+    fim_trecho = min(ultimo + 1, total) if (ultimo is not None and total) else (ultimo + 1 if ultimo is not None else total)
+    previstos = math.ceil((fim_trecho - primeiro) / passo) if fim_trecho else None
+    aviso = (f" | MODO TESTE: processando só {limite} quadro(s) amostrado(s)"
+             if limite is not None and (previstos is None or limite < previstos) else "")
+    print(f"\n[{caminho}] {total or '?'} quadros a {fps:.1f} q/s ({total / fps:.0f} s)" if total else
+          f"\n[{caminho}] {fps:.1f} q/s", end="")
+    print(f" | 1 a cada {passo} quadro(s) (~{fps / passo:.1f} por segundo){aviso}")
+    if inicio or fim is not None:
+        print(f"  Trecho: de {inicio:g} s até " + (f"{fim:g} s" if fim is not None else "o fim")
+              + f" (quadros {primeiro} a {ultimo if ultimo is not None else 'fim'})")
+
+    saida.mkdir(parents=True, exist_ok=True)
+    config = config_experimento(caminho, limite)
+    config.update({"video": str(caminho), "video_fps": fps, "video_quadros": total, "video_passo": passo,
+                   "video_inicio_s": inicio, "video_fim_s": fim})
+    (saida / "experimento.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ultima_leitura = {}   # placa -> tempo (s, do vídeo) da última vez que foi lida
+    tempo_atual = 0.0
+
+    def decidir_publicacao(placa: str, conf_min: float) -> str:
+        anterior = ultima_leitura.get(placa)
+        if anterior is not None and tempo_atual - anterior < VIDEO_JANELA_REPETICAO_S:
+            ultima_leitura[placa] = tempo_atual   # a janela recomeça a cada leitura (o carro ainda está lá)
+            return "repetida"
+        if conf_min < VIDEO_CONFIANCA_MINIMA:
+            return "baixa_confianca"              # não marca a placa: uma leitura melhor ainda pode ser publicada
+        ultima_leitura[placa] = tempo_atual
+        return "sim"
+
+    processados = com_placa = repetidas = baixas = 0
+    numero = primeiro - 1
+    if primeiro:
+        video.set(cv2.CAP_PROP_POS_FRAMES, primeiro)   # pula direto para o início do trecho
+    with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
+            criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
+        escritor = csv.writer(arq_csv)
+        escritor.writerow(["quadro", "tempo_s", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
+                           "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado"])
+        while limite is None or processados < limite:
+            numero += 1
+            if ultimo is not None and numero > ultimo:
+                break
+            if (numero - primeiro) % passo:
+                if not video.grab():   # pula o quadro sem decodificar a imagem
+                    break
+                continue
+            ok, img = video.read()
+            if not ok:
+                break
+            processados += 1
+            tempo_atual = numero / fps
+            capturado_em = agora_utc()  # instante da leitura do quadro (o arquivo não tem a hora real)
+
+            caixas, crops, resultados, extras, publicacao = processar_quadro(
+                img, f"quadro {numero}", numero, capturado_em, modelo_yolo, ocr, construtor, publicador,
+                decidir_publicacao)
+            if not resultados:
+                if processados % 50 == 0:
+                    print(f"  ... {processados} quadros processados ({tempo_atual:.0f} s do vídeo)")
+                continue
+
+            com_placa += 1
+            repetidas += publicacao.count("repetida")
+            baixas += publicacao.count("baixa_confianca")
+            mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
+            cv2.imwrite(str(saida / f"quadro_{numero:06d}_mosaico.jpg"), mosaico)
+            for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub in zip(
+                    resultados, extras, publicacao):
+                escritor.writerow([numero, f"{tempo_atual:.2f}", placa, tipo, f"{conf_det:.3f}", f"{conf_ocr:.3f}",
+                                   bruto, f"{conf_min:.3f}", confs_txt, pub])
+            print(f"[{tempo_atual:7.2f} s | quadro {numero}] "
+                  + ", ".join(r[0] + (f" ({p.replace('_', ' ')})" if p not in ("sim", "") else "")
+                              for r, p in zip(resultados, publicacao)))
+    video.release()
+
+    print(f"{processados} quadro(s) processado(s), {com_placa} com placa. Não publicadas: {repetidas} por repetição "
+          f"(janela de {VIDEO_JANELA_REPETICAO_S:g} s), {baixas} por baixa confiança (< {VIDEO_CONFIANCA_MINIMA:g}).")
+    print(f"Resultados salvos em: {saida}")
+    print(f"Publicação: {publicador.resumo()}")
+
+
+def main(limite: int | None = None, video: str | None = None, inicio: float | None = None,
+         fim: float | None = None):
+    caminho_video = None
+    if (inicio is not None or fim is not None) and not video:
+        raise SystemExit("[ERRO] --inicio e --fim só valem junto com --video.")
+    if inicio is not None and fim is not None and fim <= inicio:
+        raise SystemExit("[ERRO] --fim deve ser maior que --inicio.")
+    if video:
+        caminho_video = RAIZ / video.strip().strip('"').strip("'")
+        if not caminho_video.is_file():
+            raise SystemExit(f"[ERRO] Vídeo não encontrado: {caminho_video}")
+        if caminho_video.suffix.lower() not in EXTENSOES_VIDEO:
+            print(f"[!] Extensão {caminho_video.suffix} incomum para vídeo; tentando abrir mesmo assim.")
+        if VIDEO_QUADROS_POR_SEGUNDO <= 0 or VIDEO_JANELA_REPETICAO_S < 0 or not 0 <= VIDEO_CONFIANCA_MINIMA <= 1:
+            raise SystemExit("[ERRO] VIDEO_QUADROS_POR_SEGUNDO deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
+                             "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
+        pastas, saidas = [], []
+    else:
+        pastas = listar_pastas(PASTAS_IMAGENS_BRUTO)
+    if not pastas and not caminho_video:
         raise SystemExit("[ERRO] PASTA_IMAGENS está vazia. Informe uma pasta ou uma lista separada por vírgula.")
 
     ausentes = [p for p in pastas if not p.is_dir()]
@@ -691,7 +861,9 @@ def main(limite: int | None = None):
                          "\n  ".join(str(p) for p in ausentes))
 
     # Uma pasta: grava direto em PASTA_SAIDA. Várias: uma subpasta de saída por pasta de entrada.
-    if len(pastas) == 1:
+    if caminho_video:
+        pass
+    elif len(pastas) == 1:
         saidas = [PASTA_SAIDA]
     else:
         saidas = [PASTA_SAIDA / rotulo for rotulo in rotulos_das_pastas(pastas)]
@@ -723,13 +895,17 @@ def main(limite: int | None = None):
     ARTIFACT_VERSION = ARTIFACT_VERSION_ENV or f"{versao_detector}+{OCR_MODELO.removesuffix('-model')}"
     construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION)
 
-    print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {len(pastas)} pasta(s) de imagens")
+    origem = (f"vídeo {caminho_video.name} ({VIDEO_QUADROS_POR_SEGUNDO:g} quadros/s, "
+              f"janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, confiança mínima {VIDEO_CONFIANCA_MINIMA:g})"
+              if caminho_video
+              else f"{len(pastas)} pasta(s) de imagens")
+    print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {origem}")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
           + (f" (altura alvo {PRE_ALTURA_ALVO:g}px, nitidez {PRE_NITIDEZ:g}, proporção {PRE_PROPORCAO:g})"
              if PRE_ALTURA_ALVO or PRE_NITIDEZ or PRE_PROPORCAO else "") + " | "
           f"margem={MARGEM_RECORTE_PCT:g}%"
           + (f" (Mercosul: {MARGEM_RECORTE_MERCOSUL_PCT:g}%)" if MARGEM_RECORTE_MERCOSUL_PCT is not None else "")
-          + f" | dobrar_2l={DOBRAR_2L}"
+          + f" | dobrar_2l={DOBRAR_2L} | nms_entre_classes={'sim' if NMS_ENTRE_CLASSES else 'nao'}"
           + (f" (divisão {DOBRAR_DIVISAO_PCT:g}%, folga {DOBRAR_FOLGA_PCT:g}%, "
              f"descarte do topo {DOBRAR_DESCARTE_TOPO_PCT:g}%)" if DOBRAR_2L != "nao" else ""))
     print(f"Publicação: modo={PUBLICACAO_MODO} | source_id={SOURCE_ID} | "
@@ -741,6 +917,13 @@ def main(limite: int | None = None):
     # Inicializa o OCR (uma vez)
     ocr = DefaultOCR(hub_ocr_model=OCR_MODELO)
 
+    if caminho_video:
+        # trechos diferentes do mesmo vídeo vão para pastas diferentes (não se sobrescrevem)
+        sufixo = (f"_{inicio or 0:g}-{fim:g}s" if fim is not None
+                  else f"_{inicio:g}s-fim" if inicio else "")
+        saida_video = PASTA_SAIDA / (caminho_video.stem + sufixo)
+        print(f"  {caminho_video}  ->  {saida_video}")
+        processar_video(caminho_video, saida_video, modelo_yolo, ocr, construtor, limite, inicio or 0.0, fim)
     for pasta, saida in zip(pastas, saidas):
         if processar_pasta(pasta, saida, modelo_yolo, ocr, construtor, limite):
             break  # usuário pediu para sair
@@ -763,16 +946,40 @@ def inteiro_positivo(texto: str) -> int:
     return valor
 
 
+def segundos(texto: str) -> float:
+    """Aceita segundos (90 ou 90.5) ou minutos:segundos (1:30)."""
+    try:
+        if ":" in texto:
+            minutos, seg = texto.split(":", 1)
+            valor = int(minutos) * 60 + float(seg)
+        else:
+            valor = float(texto)
+    except ValueError:
+        valor = -1
+    if valor < 0:
+        raise argparse.ArgumentTypeError(f"'{texto}' não é um tempo válido (use 90, 90.5 ou 1:30)")
+    return valor
+
+
 def ler_argumentos():
     parser = argparse.ArgumentParser(
         description="Pipeline ALPR: YOLO próprio (4 classes) + OCR Fast-ALPR. "
                     "As pastas e os caminhos vêm do .env (PASTA_IMAGENS, PASTA_SAIDA, CAMINHO_MODELO_YOLO).")
     parser.add_argument(
         "-n", "--limite", type=inteiro_positivo, default=None, metavar="N",
-        help="modo teste: processa só as N primeiras imagens de cada pasta "
-             "(sem este argumento, processa todas)")
+        help="modo teste: processa só as N primeiras imagens de cada pasta, ou os N primeiros "
+             "quadros amostrados do vídeo (sem este argumento, processa tudo)")
+    parser.add_argument(
+        "--video", metavar="ARQUIVO", default=None,
+        help="processa um vídeo (ex.: videos/portao.mp4, relativo à raiz do projeto) em vez das "
+             "pastas de PASTA_IMAGENS. Saída em PASTA_SAIDA/<nome do vídeo>")
+    parser.add_argument("--inicio", type=segundos, default=None, metavar="TEMPO",
+                        help="com --video: começa neste ponto (segundos, ex.: 90, ou minutos:segundos, ex.: 1:30)")
+    parser.add_argument("--fim", type=segundos, default=None, metavar="TEMPO",
+                        help="com --video: para neste ponto (mesmo formato do --inicio)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main(ler_argumentos().limite)
+    argumentos = ler_argumentos()
+    main(argumentos.limite, argumentos.video, argumentos.inicio, argumentos.fim)
