@@ -13,7 +13,9 @@ Pipeline ALPR Personalizado:
 8. Experimentos de OCR controlados pelo .env (todos neutros por padrão): PREPROCESSAMENTO,
    MARGEM_RECORTE_PCT, DOBRAR_2L, DOBRAR_DIVISAO_PCT, OCR_MODELO. Cada execução grava um
    experimento.json com a configuração usada, e o resultados.csv inclui o texto BRUTO do OCR.
-9. Vídeo (--video arquivo.mp4, trecho opcional com --inicio/--fim): processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo do vídeo
+9. Stream do P4 (--p4 video|imx519|imx477): lê os quadros da memória compartilhada do P4, com as mesmas
+   regras do vídeo.
+10. Vídeo (--video arquivo.mp4, trecho opcional com --inicio/--fim): processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo do vídeo
    e não republica a mesma placa enquanto ela continuar sendo lida (janela VIDEO_JANELA_REPETICAO_S).
 """
 import argparse
@@ -22,6 +24,8 @@ import json
 import math
 import os
 import re
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -96,6 +100,9 @@ VIDEO_JANELA_REPETICAO_S = env_numero("VIDEO_JANELA_REPETICAO_S", 10)    # a mes
 # confiança ficam só no CSV; a leitura nítida que costuma vir nos quadros seguintes é a publicada. 0 = desliga.
 VIDEO_CONFIANCA_MINIMA = env_numero("VIDEO_CONFIANCA_MINIMA", LIMIAR_INCERTEZA)
 EXTENSOES_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+# --- Stream do P4 (--p4) --- usa também VIDEO_JANELA_REPETICAO_S e VIDEO_CONFIANCA_MINIMA
+P4_ESPERA_S = env_numero("P4_ESPERA_S", 30)   # encerra depois deste tempo sem receber quadros do P4
 
 CONF_DETECCAO = 0.25
 # Supressão de caixas sobrepostas também entre classes diferentes (sim | nao). Com "nao" (padrão da
@@ -721,17 +728,83 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
     return interrompido
 
 
+def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, construtor: ConstrutorEventos,
+                      limite: int | None = None, origem_tempo: str = "do vídeo"):
+    """
+    Parte comum do vídeo e da stream do P4. `quadros` é um iterador de (numero, tempo_s, img): o número
+    do quadro vai para o `frame_index` do evento e o tempo (em segundos) controla a janela de repetição.
+    Grava em `saida`: experimento.json, resultados.csv (uma linha por leitura, com quadro e tempo),
+    mosaicos só dos quadros com placa e, conforme PUBLICACAO_MODO, os eventos.
+    Só vira evento a leitura com confiança mínima >= VIDEO_CONFIANCA_MINIMA (as outras aparecem no CSV
+    como "baixa_confianca"). A mesma placa só volta a ser publicada depois de ficar
+    VIDEO_JANELA_REPETICAO_S segundos sem ser lida; as leituras barradas aparecem no CSV como "repetida".
+    Com `limite`, para depois de N quadros processados. Ctrl+C encerra normalmente (grava o que já leu).
+    """
+    saida.mkdir(parents=True, exist_ok=True)
+    (saida / "experimento.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ultima_leitura = {}   # placa -> tempo (s) da última vez que foi lida
+    tempo_atual = 0.0
+
+    def decidir_publicacao(placa: str, conf_min: float) -> str:
+        anterior = ultima_leitura.get(placa)
+        if anterior is not None and tempo_atual - anterior < VIDEO_JANELA_REPETICAO_S:
+            ultima_leitura[placa] = tempo_atual   # a janela recomeça a cada leitura (o carro ainda está lá)
+            return "repetida"
+        if conf_min < VIDEO_CONFIANCA_MINIMA:
+            return "baixa_confianca"              # não marca a placa: uma leitura melhor ainda pode ser publicada
+        ultima_leitura[placa] = tempo_atual
+        return "sim"
+
+    processados = com_placa = repetidas = baixas = 0
+    with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
+            criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
+        escritor = csv.writer(arq_csv)
+        escritor.writerow(["quadro", "tempo_s", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
+                           "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado"])
+        try:
+            for numero, tempo, img in quadros:
+                if limite is not None and processados >= limite:
+                    break
+                processados += 1
+                tempo_atual = tempo
+                capturado_em = agora_utc()  # instante da leitura do quadro (o arquivo não tem a hora real)
+
+                caixas, crops, resultados, extras, publicacao = processar_quadro(
+                    img, f"quadro {numero}", numero, capturado_em, modelo_yolo, ocr, construtor, publicador,
+                    decidir_publicacao)
+                if not resultados:
+                    if processados % 50 == 0:
+                        print(f"  ... {processados} quadros processados ({tempo_atual:.0f} s {origem_tempo})")
+                    continue
+
+                com_placa += 1
+                repetidas += publicacao.count("repetida")
+                baixas += publicacao.count("baixa_confianca")
+                mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
+                cv2.imwrite(str(saida / f"quadro_{numero:06d}_mosaico.jpg"), mosaico)
+                for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub in zip(
+                        resultados, extras, publicacao):
+                    escritor.writerow([numero, f"{tempo_atual:.2f}", placa, tipo, f"{conf_det:.3f}",
+                                       f"{conf_ocr:.3f}", bruto, f"{conf_min:.3f}", confs_txt, pub])
+                print(f"[{tempo_atual:7.2f} s | quadro {numero}] "
+                      + ", ".join(r[0] + (f" ({p.replace('_', ' ')})" if p not in ("sim", "") else "")
+                                  for r, p in zip(resultados, publicacao)))
+        except KeyboardInterrupt:
+            print("\nInterrompido (Ctrl+C). Gravando o que já foi lido...")
+
+    print(f"{processados} quadro(s) processado(s), {com_placa} com placa. Não publicadas: {repetidas} por repetição "
+          f"(janela de {VIDEO_JANELA_REPETICAO_S:g} s), {baixas} por baixa confiança (< {VIDEO_CONFIANCA_MINIMA:g}).")
+    print(f"Resultados salvos em: {saida}")
+    print(f"Publicação: {publicador.resumo()}")
+
+
 def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
                     limite: int | None = None, inicio: float = 0.0, fim: float | None = None):
     """
     Roda o pipeline em um arquivo de vídeo. Processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo
-    do vídeo (os outros são pulados) e grava em `saida`: resultados.csv (uma linha por leitura,
-    com o quadro e o tempo), mosaicos só dos quadros com placa e, conforme PUBLICACAO_MODO, os eventos.
-    O `frame_index` do evento é o número do quadro no vídeo (a partir de 0).
-    Só vira evento a leitura com confiança mínima >= VIDEO_CONFIANCA_MINIMA (as outras aparecem no CSV
-    como "baixa_confianca"). A mesma placa só volta a ser publicada depois de ficar
-    VIDEO_JANELA_REPETICAO_S segundos (tempo do vídeo) sem ser lida; as leituras barradas aparecem no
-    CSV como "repetida".
+    do vídeo (os outros são pulados); o `frame_index` do evento é o número do quadro no vídeo (a partir
+    de 0) e a janela de repetição usa o tempo do vídeo. Regras de publicação e saídas: processar_quadros.
     Com `limite`, processa só os N primeiros quadros amostrados. Com `inicio`/`fim` (segundos do
     vídeo), processa só esse trecho; o número do quadro e o tempo continuam os do vídeo inteiro.
     """
@@ -762,80 +835,79 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
         print(f"  Trecho: de {inicio:g} s até " + (f"{fim:g} s" if fim is not None else "o fim")
               + f" (quadros {primeiro} a {ultimo if ultimo is not None else 'fim'})")
 
-    saida.mkdir(parents=True, exist_ok=True)
     config = config_experimento(caminho, limite)
     config.update({"video": str(caminho), "video_fps": fps, "video_quadros": total, "video_passo": passo,
                    "video_inicio_s": inicio, "video_fim_s": fim})
-    (saida / "experimento.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    ultima_leitura = {}   # placa -> tempo (s, do vídeo) da última vez que foi lida
-    tempo_atual = 0.0
-
-    def decidir_publicacao(placa: str, conf_min: float) -> str:
-        anterior = ultima_leitura.get(placa)
-        if anterior is not None and tempo_atual - anterior < VIDEO_JANELA_REPETICAO_S:
-            ultima_leitura[placa] = tempo_atual   # a janela recomeça a cada leitura (o carro ainda está lá)
-            return "repetida"
-        if conf_min < VIDEO_CONFIANCA_MINIMA:
-            return "baixa_confianca"              # não marca a placa: uma leitura melhor ainda pode ser publicada
-        ultima_leitura[placa] = tempo_atual
-        return "sim"
-
-    processados = com_placa = repetidas = baixas = 0
-    numero = primeiro - 1
-    if primeiro:
-        video.set(cv2.CAP_PROP_POS_FRAMES, primeiro)   # pula direto para o início do trecho
-    with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
-            criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
-        escritor = csv.writer(arq_csv)
-        escritor.writerow(["quadro", "tempo_s", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
-                           "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado"])
-        while limite is None or processados < limite:
+    def quadros():
+        numero = primeiro - 1
+        if primeiro:
+            video.set(cv2.CAP_PROP_POS_FRAMES, primeiro)   # pula direto para o início do trecho
+        while True:
             numero += 1
             if ultimo is not None and numero > ultimo:
-                break
+                return
             if (numero - primeiro) % passo:
                 if not video.grab():   # pula o quadro sem decodificar a imagem
-                    break
+                    return
                 continue
             ok, img = video.read()
             if not ok:
-                break
-            processados += 1
-            tempo_atual = numero / fps
-            capturado_em = agora_utc()  # instante da leitura do quadro (o arquivo não tem a hora real)
+                return
+            yield numero, numero / fps, img
 
-            caixas, crops, resultados, extras, publicacao = processar_quadro(
-                img, f"quadro {numero}", numero, capturado_em, modelo_yolo, ocr, construtor, publicador,
-                decidir_publicacao)
-            if not resultados:
-                if processados % 50 == 0:
-                    print(f"  ... {processados} quadros processados ({tempo_atual:.0f} s do vídeo)")
-                continue
+    try:
+        processar_quadros(quadros(), saida, config, modelo_yolo, ocr, construtor, limite)
+    finally:
+        video.release()
 
-            com_placa += 1
-            repetidas += publicacao.count("repetida")
-            baixas += publicacao.count("baixa_confianca")
-            mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
-            cv2.imwrite(str(saida / f"quadro_{numero:06d}_mosaico.jpg"), mosaico)
-            for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub in zip(
-                    resultados, extras, publicacao):
-                escritor.writerow([numero, f"{tempo_atual:.2f}", placa, tipo, f"{conf_det:.3f}", f"{conf_ocr:.3f}",
-                                   bruto, f"{conf_min:.3f}", confs_txt, pub])
-            print(f"[{tempo_atual:7.2f} s | quadro {numero}] "
-                  + ", ".join(r[0] + (f" ({p.replace('_', ' ')})" if p not in ("sim", "") else "")
-                              for r, p in zip(resultados, publicacao)))
-    video.release()
 
-    print(f"{processados} quadro(s) processado(s), {com_placa} com placa. Não publicadas: {repetidas} por repetição "
-          f"(janela de {VIDEO_JANELA_REPETICAO_S:g} s), {baixas} por baixa confiança (< {VIDEO_CONFIANCA_MINIMA:g}).")
-    print(f"Resultados salvos em: {saida}")
-    print(f"Publicação: {publicador.resumo()}")
+def processar_p4(fonte: str, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
+                 limite: int | None = None):
+    """
+    Lê a stream do P4 (memória compartilhada local, protocolo P4R1) e roda o pipeline em cada quadro.
+    O P4 entrega sempre o quadro mais recente: enquanto o I7 processa um, os seguintes são descartados,
+    então o ritmo se ajusta sozinho à velocidade do I7. O `frame_index` do evento é o `frame_id` do P4 e o
+    `session_id` é o da sessão do P4. A janela de repetição usa o tempo real desde o início da leitura.
+    Para com `limite` quadros processados, com Ctrl+C ou depois de P4_ESPERA_S segundos sem quadros.
+    """
+    from fonte_p4 import LeitorP4, caminho_socket   # import tardio: só a leitura do P4 precisa do GStreamer
+
+    socket = caminho_socket(fonte)
+    print(f"\n[P4] lendo {socket} | espera até {P4_ESPERA_S:g} s por quadros"
+          + (f" | MODO TESTE: {limite} quadro(s)" if limite is not None else " | Ctrl+C para encerrar"))
+    config = config_experimento(Path(socket), limite)
+    config.update({"p4_socket": socket, "p4_espera_s": P4_ESPERA_S})
+    inicio = time.monotonic()
+
+    def quadros():
+        with LeitorP4(socket) as leitor:
+            ultima_sessao = None
+            for campos, img in leitor.quadros(P4_ESPERA_S):
+                sessao = campos.get("session_id")
+                if sessao and sessao != ultima_sessao:
+                    ultima_sessao = sessao
+                    if _uuid_valido(sessao):
+                        construtor.session_id = sessao   # os eventos levam a sessão do P4 (como na 6c)
+                    print(f"[P4] sessão {sessao} | fonte {campos.get('source_id')} | "
+                          f"{campos.get('width')}x{campos.get('height')} {campos.get('format')}")
+                yield int(campos.get("frame_id", 0)), time.monotonic() - inicio, img
+
+    processar_quadros(quadros(), saida, config, modelo_yolo, ocr, construtor, limite, "de leitura")
+
+
+def _uuid_valido(texto) -> bool:
+    try:
+        return str(uuid.UUID(str(texto))) == str(texto).lower()
+    except ValueError:
+        return False
 
 
 def main(limite: int | None = None, video: str | None = None, inicio: float | None = None,
-         fim: float | None = None):
+         fim: float | None = None, p4: str | None = None):
     caminho_video = None
+    if video and p4:
+        raise SystemExit("[ERRO] Use --video ou --p4, não os dois.")
     if (inicio is not None or fim is not None) and not video:
         raise SystemExit("[ERRO] --inicio e --fim só valem junto com --video.")
     if inicio is not None and fim is not None and fim <= inicio:
@@ -850,9 +922,14 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
             raise SystemExit("[ERRO] VIDEO_QUADROS_POR_SEGUNDO deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
                              "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
         pastas, saidas = [], []
+    elif p4:
+        if P4_ESPERA_S <= 0 or VIDEO_JANELA_REPETICAO_S < 0 or not 0 <= VIDEO_CONFIANCA_MINIMA <= 1:
+            raise SystemExit("[ERRO] P4_ESPERA_S deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
+                             "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
+        pastas, saidas = [], []
     else:
         pastas = listar_pastas(PASTAS_IMAGENS_BRUTO)
-    if not pastas and not caminho_video:
+    if not pastas and not caminho_video and not p4:
         raise SystemExit("[ERRO] PASTA_IMAGENS está vazia. Informe uma pasta ou uma lista separada por vírgula.")
 
     ausentes = [p for p in pastas if not p.is_dir()]
@@ -861,7 +938,7 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
                          "\n  ".join(str(p) for p in ausentes))
 
     # Uma pasta: grava direto em PASTA_SAIDA. Várias: uma subpasta de saída por pasta de entrada.
-    if caminho_video:
+    if caminho_video or p4:
         pass
     elif len(pastas) == 1:
         saidas = [PASTA_SAIDA]
@@ -898,6 +975,8 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
     origem = (f"vídeo {caminho_video.name} ({VIDEO_QUADROS_POR_SEGUNDO:g} quadros/s, "
               f"janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, confiança mínima {VIDEO_CONFIANCA_MINIMA:g})"
               if caminho_video
+              else f"stream do P4 '{p4}' (janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, "
+                   f"confiança mínima {VIDEO_CONFIANCA_MINIMA:g})" if p4
               else f"{len(pastas)} pasta(s) de imagens")
     print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {origem}")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
@@ -924,6 +1003,10 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
         saida_video = PASTA_SAIDA / (caminho_video.stem + sufixo)
         print(f"  {caminho_video}  ->  {saida_video}")
         processar_video(caminho_video, saida_video, modelo_yolo, ocr, construtor, limite, inicio or 0.0, fim)
+    if p4:
+        saida_p4 = PASTA_SAIDA / ("p4_" + re.sub(r"[^A-Za-z0-9_-]+", "_", Path(p4).name.removeprefix("p4_")))
+        print(f"  P4 '{p4}'  ->  {saida_p4}")
+        processar_p4(p4, saida_p4, modelo_yolo, ocr, construtor, limite)
     for pasta, saida in zip(pastas, saidas):
         if processar_pasta(pasta, saida, modelo_yolo, ocr, construtor, limite):
             break  # usuário pediu para sair
@@ -973,6 +1056,10 @@ def ler_argumentos():
         "--video", metavar="ARQUIVO", default=None,
         help="processa um vídeo (ex.: videos/portao.mp4, relativo à raiz do projeto) em vez das "
              "pastas de PASTA_IMAGENS. Saída em PASTA_SAIDA/<nome do vídeo>")
+    parser.add_argument(
+        "--p4", metavar="FONTE", default=None,
+        help="lê a stream do P4 na mesma máquina: video, imx519, imx477 ou o caminho do socket "
+             "(ex.: /tmp/p4_file_shm). Para com -n, Ctrl+C ou P4_ESPERA_S segundos sem quadros")
     parser.add_argument("--inicio", type=segundos, default=None, metavar="TEMPO",
                         help="com --video: começa neste ponto (segundos, ex.: 90, ou minutos:segundos, ex.: 1:30)")
     parser.add_argument("--fim", type=segundos, default=None, metavar="TEMPO",
@@ -982,4 +1069,4 @@ def ler_argumentos():
 
 if __name__ == "__main__":
     argumentos = ler_argumentos()
-    main(argumentos.limite, argumentos.video, argumentos.inicio, argumentos.fim)
+    main(argumentos.limite, argumentos.video, argumentos.inicio, argumentos.fim, argumentos.p4)
