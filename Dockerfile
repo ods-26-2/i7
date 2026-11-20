@@ -3,9 +3,13 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Bibliotecas de sistema que o OpenCV precisa
+# Bibliotecas de sistema que o OpenCV precisa, mais o GStreamer com Python (gi) para ler a stream do P4
+# (--p4; shmsrc fica no plugins-bad). O gi do apt é do Python 3.11 do Debian, a mesma versão desta imagem;
+# o scripts/fonte_p4.py acrescenta /usr/lib/python3/dist-packages ao caminho só quando precisa dele.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 \
+        python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-bad \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
