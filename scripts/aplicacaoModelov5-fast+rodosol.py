@@ -92,6 +92,9 @@ ARTIFACT_VERSION_ENV = os.getenv("ARTIFACT_VERSION")   # se vazio, é montado em
 VIDEO_QUADROS_POR_SEGUNDO = env_numero("VIDEO_QUADROS_POR_SEGUNDO", 2)   # quadros processados por segundo DO VÍDEO
 VIDEO_JANELA_REPETICAO_S = env_numero("VIDEO_JANELA_REPETICAO_S", 10)    # a mesma placa só volta a ser publicada
                                                                          # depois de ficar este tempo (do vídeo) sem ser lida
+# No vídeo, só vira evento a leitura com confiança mínima >= este valor (padrão: LIMIAR_INCERTEZA). As de baixa
+# confiança ficam só no CSV; a leitura nítida que costuma vir nos quadros seguintes é a publicada. 0 = desliga.
+VIDEO_CONFIANCA_MINIMA = env_numero("VIDEO_CONFIANCA_MINIMA", LIMIAR_INCERTEZA)
 EXTENSOES_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 CONF_DETECCAO = 0.25
@@ -446,6 +449,7 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "pre_proporcao": PRE_PROPORCAO,
         "video_quadros_por_segundo": VIDEO_QUADROS_POR_SEGUNDO,
         "video_janela_repeticao_s": VIDEO_JANELA_REPETICAO_S,
+        "video_confianca_minima": VIDEO_CONFIANCA_MINIMA,
     }
 
 
@@ -547,14 +551,15 @@ def rotulos_das_pastas(pastas: list[Path]) -> list[str]:
 
 # ------------------------------- MAIN ----------------------------------
 def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo, ocr,
-                     construtor: ConstrutorEventos, publicador, pode_publicar=None):
+                     construtor: ConstrutorEventos, publicador, decidir_publicacao=None):
     """
     Roda o pipeline em UMA imagem já aberta (de uma pasta ou, futuramente, um quadro de vídeo):
     detecção, recorte, OCR e validação, e publica um evento por leitura aceita.
     `nome` só aparece nas mensagens; `frame_index` e `capturado_em` vão para o evento.
-    `pode_publicar(placa)`, se informado, decide se uma leitura aceita vira evento (no vídeo,
-    evita republicar a mesma placa). Devolve (caixas, crops, resultados, extras, publicacao),
-    usados no mosaico e no resultados.csv. `publicacao`, por leitura: "sim", "repetida" ou "".
+    `decidir_publicacao(placa, conf_min)`, se informado, decide se uma leitura aceita vira evento
+    (no vídeo: "sim", "repetida" ou "baixa_confianca"). Devolve (caixas, crops, resultados, extras,
+    publicacao), usados no mosaico e no resultados.csv. `publicacao`, por leitura: "sim", o motivo
+    de não ter sido publicada ou "" (leitura recusada pela validação ou publicação desligada).
     """
     # Inferencia no detector YOLO
     yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False)[0]
@@ -563,7 +568,7 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
     crops = []
     resultados = []
     extras = []  # por placa, alinhada às listas acima: (texto bruto, confiança mínima, confianças)
-    publicacao = []  # por placa: "sim" (evento gerado), "repetida" (barrada pela janela) ou ""
+    publicacao = []  # por placa: "sim" (evento gerado), "repetida", "baixa_confianca" ou ""
 
     for indice_deteccao, box in enumerate(yolo_results.boxes):
         conf_det = float(box.conf[0])
@@ -627,8 +632,9 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
             confs_7 = confiancas_dos_7_caracteres(texto_ocr, ocr_result.confidence if ocr_result else None)
             if confs_7 is None:
                 print(f"[PUBLICAÇÃO] {nome}: sem confiança por caractere alinhada; evento não publicado")
-            elif pode_publicar is not None and not pode_publicar(placa_validada):
-                publicado = "repetida"
+            elif decidir_publicacao is not None and \
+                    (decisao := decidir_publicacao(placa_validada, conf_min)) != "sim":
+                publicado = decisao
             else:
                 publicado = "sim"
                 publicador.publicar(construtor.plate_read(
@@ -719,8 +725,10 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
     do vídeo (os outros são pulados) e grava em `saida`: resultados.csv (uma linha por leitura,
     com o quadro e o tempo), mosaicos só dos quadros com placa e, conforme PUBLICACAO_MODO, os eventos.
     O `frame_index` do evento é o número do quadro no vídeo (a partir de 0).
-    A mesma placa só volta a ser publicada depois de ficar VIDEO_JANELA_REPETICAO_S segundos (tempo
-    do vídeo) sem ser lida; as leituras barradas aparecem no CSV como "repetida".
+    Só vira evento a leitura com confiança mínima >= VIDEO_CONFIANCA_MINIMA (as outras aparecem no CSV
+    como "baixa_confianca"). A mesma placa só volta a ser publicada depois de ficar
+    VIDEO_JANELA_REPETICAO_S segundos (tempo do vídeo) sem ser lida; as leituras barradas aparecem no
+    CSV como "repetida".
     Com `limite`, processa só os N primeiros quadros amostrados. Com `inicio`/`fim` (segundos do
     vídeo), processa só esse trecho; o número do quadro e o tempo continuam os do vídeo inteiro.
     """
@@ -760,12 +768,17 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
     ultima_leitura = {}   # placa -> tempo (s, do vídeo) da última vez que foi lida
     tempo_atual = 0.0
 
-    def pode_publicar(placa: str) -> bool:
+    def decidir_publicacao(placa: str, conf_min: float) -> str:
         anterior = ultima_leitura.get(placa)
-        ultima_leitura[placa] = tempo_atual   # a janela recomeça a cada leitura (o carro ainda está lá)
-        return anterior is None or tempo_atual - anterior >= VIDEO_JANELA_REPETICAO_S
+        if anterior is not None and tempo_atual - anterior < VIDEO_JANELA_REPETICAO_S:
+            ultima_leitura[placa] = tempo_atual   # a janela recomeça a cada leitura (o carro ainda está lá)
+            return "repetida"
+        if conf_min < VIDEO_CONFIANCA_MINIMA:
+            return "baixa_confianca"              # não marca a placa: uma leitura melhor ainda pode ser publicada
+        ultima_leitura[placa] = tempo_atual
+        return "sim"
 
-    processados = com_placa = repetidas = 0
+    processados = com_placa = repetidas = baixas = 0
     numero = primeiro - 1
     if primeiro:
         video.set(cv2.CAP_PROP_POS_FRAMES, primeiro)   # pula direto para o início do trecho
@@ -791,7 +804,7 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
 
             caixas, crops, resultados, extras, publicacao = processar_quadro(
                 img, f"quadro {numero}", numero, capturado_em, modelo_yolo, ocr, construtor, publicador,
-                pode_publicar)
+                decidir_publicacao)
             if not resultados:
                 if processados % 50 == 0:
                     print(f"  ... {processados} quadros processados ({tempo_atual:.0f} s do vídeo)")
@@ -799,6 +812,7 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
 
             com_placa += 1
             repetidas += publicacao.count("repetida")
+            baixas += publicacao.count("baixa_confianca")
             mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
             cv2.imwrite(str(saida / f"quadro_{numero:06d}_mosaico.jpg"), mosaico)
             for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub in zip(
@@ -806,11 +820,12 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
                 escritor.writerow([numero, f"{tempo_atual:.2f}", placa, tipo, f"{conf_det:.3f}", f"{conf_ocr:.3f}",
                                    bruto, f"{conf_min:.3f}", confs_txt, pub])
             print(f"[{tempo_atual:7.2f} s | quadro {numero}] "
-                  + ", ".join(r[0] + (" (repetida)" if p == "repetida" else "") for r, p in zip(resultados, publicacao)))
+                  + ", ".join(r[0] + (f" ({p.replace('_', ' ')})" if p not in ("sim", "") else "")
+                              for r, p in zip(resultados, publicacao)))
     video.release()
 
-    print(f"{processados} quadro(s) processado(s), {com_placa} com placa, "
-          f"{repetidas} leitura(s) não publicada(s) por repetição (janela de {VIDEO_JANELA_REPETICAO_S:g} s).")
+    print(f"{processados} quadro(s) processado(s), {com_placa} com placa. Não publicadas: {repetidas} por repetição "
+          f"(janela de {VIDEO_JANELA_REPETICAO_S:g} s), {baixas} por baixa confiança (< {VIDEO_CONFIANCA_MINIMA:g}).")
     print(f"Resultados salvos em: {saida}")
     print(f"Publicação: {publicador.resumo()}")
 
@@ -828,8 +843,9 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
             raise SystemExit(f"[ERRO] Vídeo não encontrado: {caminho_video}")
         if caminho_video.suffix.lower() not in EXTENSOES_VIDEO:
             print(f"[!] Extensão {caminho_video.suffix} incomum para vídeo; tentando abrir mesmo assim.")
-        if VIDEO_QUADROS_POR_SEGUNDO <= 0 or VIDEO_JANELA_REPETICAO_S < 0:
-            raise SystemExit("[ERRO] VIDEO_QUADROS_POR_SEGUNDO deve ser > 0 e VIDEO_JANELA_REPETICAO_S >= 0.")
+        if VIDEO_QUADROS_POR_SEGUNDO <= 0 or VIDEO_JANELA_REPETICAO_S < 0 or not 0 <= VIDEO_CONFIANCA_MINIMA <= 1:
+            raise SystemExit("[ERRO] VIDEO_QUADROS_POR_SEGUNDO deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
+                             "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
         pastas, saidas = [], []
     else:
         pastas = listar_pastas(PASTAS_IMAGENS_BRUTO)
@@ -877,7 +893,8 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
     construtor = ConstrutorEventos(SOURCE_ID, ARTIFACT_VERSION)
 
     origem = (f"vídeo {caminho_video.name} ({VIDEO_QUADROS_POR_SEGUNDO:g} quadros/s, "
-              f"janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s)" if caminho_video
+              f"janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, confiança mínima {VIDEO_CONFIANCA_MINIMA:g})"
+              if caminho_video
               else f"{len(pastas)} pasta(s) de imagens")
     print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {origem}")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
