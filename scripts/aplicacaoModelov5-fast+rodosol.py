@@ -180,16 +180,13 @@ def pre_processar_recorte_ocr(crop: np.ndarray) -> np.ndarray:
 
 
 def forcar_sete_caracteres(texto: str) -> str:
-    """Garante uma string de exatamente 7 caracteres descartando ruídos no meio."""
-    if len(texto) == 7:
-        return texto
-
-    if len(texto) > 7:
-        candidato_sem_meio = texto[:3] + texto[4:]
-        if len(candidato_sem_meio) == 7:
-            return candidato_sem_meio
-        return texto[:7]
-
+    """
+    Devolve o texto como está. Leituras com mais (ou menos) de 7 caracteres NÃO são cortadas: elas
+    seguem com o tamanho original e são recusadas pela validação de formato.
+    Antes, uma leitura de 8 caracteres perdia um caractere e podia virar uma placa brasileira válida,
+    mas errada (ex.: a placa estrangeira 34A36837 virava BAA6837). Nas 800 imagens de teste, as 5
+    leituras com mais de 7 caracteres estavam todas erradas (4 delas eram aceitas depois do corte).
+    """
     return texto
 
 
