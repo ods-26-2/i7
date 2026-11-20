@@ -70,6 +70,25 @@ Tudo que vem depois de `./run.sh` (ou `.\run.ps1`) é executado dentro do contai
 
 Os resultados aparecem na pasta `saidas/` do seu computador.
 
+## Vídeos
+
+Os vídeos ficam na pasta `videos/` do projeto (criada pelo `run.sh`/`run.ps1`; não vai para o Git).
+
+```bash
+# baixar um vídeo (ex.: do YouTube) para videos/
+./run.sh scripts/baixar_video.py "https://www.youtube.com/watch?v=..." --nome portao
+
+# processar o vídeo inteiro, ou só um trecho (segundos ou minutos:segundos)
+./run.sh scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4
+./run.sh scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4 --inicio 1:30 --fim 2:10
+```
+
+O resultado vai para `saidas/portao/` (ou `saidas/portao_90-130s/` com trecho). Para cortar um trecho num arquivo novo: `./run.sh scripts/cortar_video.py videos/portao.mp4 --inicio 1:30 --fim 2:10`.
+
+## Stream do P4
+
+Na Jetson, o I7 lê as câmeras do P4 com `--p4 imx519` (ou `imx477`, `video`): veja `RODAR_NA_JETSON.md`. Para testar no seu computador, com a câmera simulada do P4, siga a seção "Stream do P4" do `README.md` (precisa de dois terminais e de `docker build -t p4-teste teste_p4`). Coloque o link entre aspas. As opções de vídeo (`VIDEO_*` no `.env`) estão explicadas no `.env.example` e no `README.md`.
+
 ## Dataset
 
 O pipeline precisa da pasta `datasetConvertidoYOLO/` na raiz do projeto. Ela **não vem no Git**: peça a alguém da equipe ou gere com `converterDataset-YOLO.py`. Os comandos `build` e `--exemplo` funcionam sem ela.
@@ -78,6 +97,7 @@ O pipeline precisa da pasta `datasetConvertidoYOLO/` na raiz do projeto. Ela **n
 
 - No `.env`, escreva os valores **sem aspas** e com **caminhos relativos** (ex.: `PASTA_SAIDA=saidas`).
 - Alterou um script ou o `requirements.txt`? Rode `./run.sh build` de novo.
+- No `--video`, use barras normais (`videos/portao.mp4`), também no PowerShell: o caminho é lido dentro do container.
 - Linux: se `saidas/` ficar com dono `root`, use `sudo chown -R $USER:$USER saidas`.
 - Linux: `permission denied` ao usar `docker` significa que falta o passo 1 e sair/entrar na sessão.
 - Windows: erro `$'\r': command not found` no `run.sh` é quebra de linha do Windows. Corrija com `dos2unix run.sh`.
@@ -100,6 +120,7 @@ docker run --rm --name ponte alpine/socat TCP-LISTEN:9092,fork,reuseaddr TCP:<ip
 docker run --rm --env-file .env --network container:ponte \
   -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
   -v "$(pwd)/saidas:/app/saidas" \
+  -v "$(pwd)/videos:/app/videos" \
   -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
   parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 2
 
@@ -116,6 +137,7 @@ No PowerShell, troque `\` por `` ` `` e `$(pwd)` por `${PWD}`. O `.env` precisa 
 docker run --rm --env-file .env \
   -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
   -v "$(pwd)/saidas:/app/saidas" \
+  -v "$(pwd)/videos:/app/videos" \
   -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
   parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 20
 ```
@@ -125,6 +147,7 @@ docker run --rm --env-file .env \
 docker run --rm --env-file .env `
   -v "${PWD}/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" `
   -v "${PWD}/saidas:/app/saidas" `
+  -v "${PWD}/videos:/app/videos" `
   -v i7-ocr-cache:/root/.cache/fast-plate-ocr `
   parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py -n 20
 ```

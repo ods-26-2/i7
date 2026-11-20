@@ -15,10 +15,11 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-mkdir -p saidas datasetConvertidoYOLO
+mkdir -p saidas datasetConvertidoYOLO videos
 
 docker run --rm --env-file .env \
   -v "$(pwd)/datasetConvertidoYOLO:/app/datasetConvertidoYOLO" \
   -v "$(pwd)/saidas:/app/saidas" \
+  -v "$(pwd)/videos:/app/videos" \
   -v i7-ocr-cache:/root/.cache/fast-plate-ocr \
   "$IMAGEM" "$@"
