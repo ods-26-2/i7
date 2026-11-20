@@ -9,7 +9,7 @@ Componente de **reconhecimento automático de placas** para controle de acesso v
 ## Fluxo
 
 ```
-imagem (pasta) ou quadro de vídeo (--video, N quadros por segundo)
+imagem (pasta), quadro de vídeo (--video) ou quadro da câmera do P4 (--p4)
        → detector YOLO (4 classes) → recorte (+ margem nas Mercosul) → OCR (cct-s-v2-global)
        → correção posicional + regex → resultado
                                          ├─ mosaico + resultados.csv
@@ -62,6 +62,8 @@ curl -L -o "$d/cct_s_v2_global_plate_config.yaml" "$base/cct_s_v2_global_plate_c
 | Arquivo | Função |
 |---|---|
 | `aplicacaoModelov5-fast+rodosol.py` | **Pipeline atual:** YOLO de 4 classes + OCR + validação, com mosaicos, CSV e publicação de eventos. Lê pastas de imagens ou um vídeo (`--video`) |
+| `fonte_p4.py` | Lê a stream do P4 (memória compartilhada local, protocolo `P4R1`) e converte os quadros para imagem. Usado pelo `--p4`; sozinho, `python scripts/fonte_p4.py video` testa a conexão |
+| `cortar_video.py` | Corta um trecho de um vídeo (sem `ffmpeg`), por exemplo para usar como câmera simulada do P4 |
 | `baixar_video.py` | Baixa um vídeo (ex.: do YouTube, com `yt-dlp`) para a pasta `videos/`, para depois rodar o pipeline com `--video` |
 | `publicador_eventos.py` | Monta e valida o evento `ods.i7.plate_read` (envelope da Arquitetura 6c + guia do Kafka) e o publica (arquivo, Kafka ou nada). Também funciona sozinho: `--exemplo`, `--validar` e `--criar-topico` |
 | `consumidor_teste.py` | Lê o tópico e valida cada evento como um consumidor faria (guia do Kafka, seções 4.2 e 4.3). Serve para conferir o que foi publicado. Modos: sem opção (relê tudo), `--novas` (só o que ainda não leu) e `--ao-vivo` (só o que chegar com ele ligado) |
@@ -104,7 +106,9 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `LIMIAR_INCERTEZA` | `0.9` | `0.9` | Se a menor confiança entre os caracteres ficar abaixo disso, o evento sai com `uncertain: true` |
 | `VIDEO_QUADROS_POR_SEGUNDO` | `2` | `2` | Só com `--video`: quadros processados por segundo do vídeo (os outros são pulados) |
 | `VIDEO_JANELA_REPETICAO_S` | `10` | `10` | Só com `--video`: a mesma placa só volta a ser publicada depois de ficar esse tempo (do vídeo) sem ser lida |
-| `VIDEO_CONFIANCA_MINIMA` | `LIMIAR_INCERTEZA` (0.9) | `0.9` | Só com `--video`: só vira evento a leitura com confiança mínima >= este valor. `0` publica todas |
+| `VIDEO_CONFIANCA_MINIMA` | `LIMIAR_INCERTEZA` (0.9) | `0.9` | Só com `--video` ou `--p4`: só vira evento a leitura com confiança mínima >= este valor. `0` publica todas |
+| `P4_ESPERA_S` | `30` | `30` | Só com `--p4`: encerra a leitura depois deste tempo (s) sem quadros |
+| `P4_BAYER` | `RGGB` | `RGGB` | Só com `--p4` e câmeras físicas: padrão do mosaico Bayer do `RG10`. Se as cores saírem trocadas, `BGGR` |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
 | `KAFKA_BROKER` | `172.18.4.56:9092` | `172.18.4.56:9092` (dentro do Dcomp) ou `200.17.66.56:9092` (fora) | Endereço do broker da Jetson (temporário); na versão final será local. Ver "Acesso ao broker da Jetson" |
 
@@ -146,6 +150,32 @@ python scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4 --ini
 - Vídeos ficam na pasta `videos/`, que não vai para o Git. Baixar do YouTube pode ferir os termos do site: use para testes e com vídeos que vocês possam usar. Se o `yt-dlp` falhar, coloque o arquivo em `videos/` por outro meio.
 
 Testes com vídeos de demonstração de câmeras LPR (placas brasileiras): as placas nítidas foram lidas corretamente e publicadas uma vez cada; as leituras erradas de placas ainda distantes ficaram abaixo de 0,9 e não viraram evento.
+
+### Stream do P4 (câmeras da Jetson)
+
+O P4 (SIS-2) publica cada quadro numa memória compartilhada **local** (um socket por câmera em `/tmp`, protocolo `P4R1`). Com `--p4 imx519`, `--p4 imx477` ou `--p4 video` (MP4 reproduzido como câmera), o I7 lê esses quadros e aplica as mesmas regras do vídeo (janela de repetição e confiança mínima, com o tempo real de leitura). O I7 pega sempre o quadro mais recente; os que chegam enquanto ele processa são descartados, sem acumular atraso. O `frame_index` do evento é o `frame_id` do P4 e o `session_id` é o da sessão do P4. Para com `-n`, Ctrl+C ou `P4_ESPERA_S` segundos sem quadros; se o P4 ainda não estiver ligado, espera.
+
+Só funciona na mesma máquina do P4: na Jetson. O passo a passo para lá está em [`RODAR_NA_JETSON.md`](RODAR_NA_JETSON.md).
+
+**Teste local, sem a Jetson** (Docker; a pasta `teste_p4/` roda a câmera simulada do P4 a partir do repositório deles, sem alterá-lo):
+
+```bash
+docker build -t p4-teste teste_p4
+python scripts/cortar_video.py videos/parkingcam.mp4 --inicio 2:27 --fim 3:03   # ou ./run.sh scripts/cortar_video.py ...
+docker volume create p4-tmp
+
+# terminal 1: o I7 (espera o P4)
+docker run --rm -it --env-file .env --ipc=host -v p4-tmp:/tmp -v "$(pwd)/saidas:/app/saidas" \
+  -v i7-ocr-cache:/root/.cache/fast-plate-ocr parkflow-i7 scripts/aplicacaoModelov5-fast+rodosol.py --p4 video
+
+# terminal 2: o P4 reproduzindo o vídeo como câmera
+docker run --rm -it --ipc=host -v p4-tmp:/tmp -v "$(pwd)/videos:/videos" \
+  -e P4_VIDEO_PATH=/videos/parkingcam_147-183s.mp4 p4-teste
+```
+
+Testado assim no Windows (Docker Desktop): o I7 conectou sozinho quando o P4 ligou e publicou as mesmas 3 placas do teste com `--video`. Se o P4 disser que o socket já existe (sobra de uma execução interrompida): `docker volume rm p4-tmp` e `docker volume create p4-tmp`.
+
+**Cores das câmeras físicas:** o `RG10` é RAW Bayer (RGGB). No OpenCV, a conversão certa para RGGB é `COLOR_BayerBG2BGR` (os nomes são "deslocados"); o leitor de exemplo do P4 usa `COLOR_BayerRG2BGR`, que troca vermelho e azul. Confirmado com imagem sintética, ainda não com a câmera real: confira um mosaico na Jetson e, se precisar, use `P4_BAYER`.
 
 ## Publicação de eventos (Kafka)
 

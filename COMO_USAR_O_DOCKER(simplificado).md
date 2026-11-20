@@ -83,7 +83,11 @@ Os vídeos ficam na pasta `videos/` do projeto (criada pelo `run.sh`/`run.ps1`; 
 ./run.sh scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4 --inicio 1:30 --fim 2:10
 ```
 
-O resultado vai para `saidas/portao/` (ou `saidas/portao_90-130s/` com trecho). Coloque o link entre aspas. As opções de vídeo (`VIDEO_*` no `.env`) estão explicadas no `.env.example` e no `README.md`.
+O resultado vai para `saidas/portao/` (ou `saidas/portao_90-130s/` com trecho). Para cortar um trecho num arquivo novo: `./run.sh scripts/cortar_video.py videos/portao.mp4 --inicio 1:30 --fim 2:10`.
+
+## Stream do P4
+
+Na Jetson, o I7 lê as câmeras do P4 com `--p4 imx519` (ou `imx477`, `video`): veja `RODAR_NA_JETSON.md`. Para testar no seu computador, com a câmera simulada do P4, siga a seção "Stream do P4" do `README.md` (precisa de dois terminais e de `docker build -t p4-teste teste_p4`). Coloque o link entre aspas. As opções de vídeo (`VIDEO_*` no `.env`) estão explicadas no `.env.example` e no `README.md`.
 
 ## Dataset
 
