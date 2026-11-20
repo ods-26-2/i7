@@ -50,8 +50,14 @@ def _iou(caixa: np.ndarray, caixas: np.ndarray) -> np.ndarray:
     return inter / np.maximum(area + areas - inter, 1e-9)
 
 
-def _nms(caixas: np.ndarray, notas: np.ndarray, classes: np.ndarray, iou: float) -> list[int]:
-    """Supressão de caixas sobrepostas, classe por classe; devolve os índices mantidos (maior nota primeiro)."""
+def _nms(caixas: np.ndarray, notas: np.ndarray, classes: np.ndarray, iou: float,
+         entre_classes: bool = False) -> list[int]:
+    """Supressão de caixas sobrepostas; devolve os índices mantidos (maior nota primeiro).
+    Por padrão, classe por classe (como a ultralytics). Com `entre_classes`, caixas sobrepostas de classes
+    diferentes também se eliminam (fica a de maior nota): evita a mesma placa detectada duas vezes,
+    uma como "antiga" e outra como "Mercosul"."""
+    if entre_classes:
+        classes = np.zeros_like(classes)
     mantidas: list[int] = []
     for classe in np.unique(classes):
         ordem = np.flatnonzero(classes == classe)
@@ -86,7 +92,8 @@ class DetectorP2:
         metadados = json.loads((raiz / engine_ref / "metadata.json").read_text(encoding="utf-8"))
         return [str(nome) for nome in metadados["classes"]]
 
-    def predict(self, img_bgr: np.ndarray, conf: float = 0.25, verbose: bool = False):
+    def predict(self, img_bgr: np.ndarray, conf: float = 0.25, verbose: bool = False,
+                agnostic_nms: bool = False):
         altura, largura = img_bgr.shape[:2]
         tensor, escala, pad_x, pad_y = _letterbox(img_bgr, self._lado)
         saidas, _ = self._p2.infer(self._handle, {self._nome_entrada: tensor})
@@ -101,7 +108,7 @@ class DetectorP2:
         deslocamento = np.array([pad_x, pad_y, pad_x, pad_y], dtype=np.float32)
         caixas = (caixas - deslocamento) / np.float32(escala)
         caixas = np.clip(caixas, 0, np.array([largura, altura, largura, altura], dtype=np.float32))
-        indices = _nms(caixas, notas, classes, self.iou)
+        indices = _nms(caixas, notas, classes, self.iou, entre_classes=agnostic_nms)
         return [SimpleNamespace(boxes=[
             SimpleNamespace(conf=[float(notas[i])], cls=[int(classes[i])], xyxy=[caixas[i]])
             for i in indices

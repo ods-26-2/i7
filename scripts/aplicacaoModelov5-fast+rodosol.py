@@ -98,6 +98,10 @@ VIDEO_CONFIANCA_MINIMA = env_numero("VIDEO_CONFIANCA_MINIMA", LIMIAR_INCERTEZA)
 EXTENSOES_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 CONF_DETECCAO = 0.25
+# Supressão de caixas sobrepostas também entre classes diferentes (sim | nao). Com "nao" (padrão da
+# ultralytics), a mesma placa pode sair duas vezes, como "antiga" e como "Mercosul"; com "sim", fica só a
+# caixa de maior confiança. Vale para os dois detectores (ultralytics: agnostic_nms; P2: detector_p2.py).
+NMS_ENTRE_CLASSES = env_sim_nao("NMS_ENTRE_CLASSES", "nao")
 MOSTRAR_JANELA = False
 ALTURA_MOSAICO = 640
 LARGURA_PAINEL = 420
@@ -433,6 +437,7 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "detector": DETECTOR,
         "modelo_yolo": str(CAMINHO_MODELO_YOLO) if DETECTOR == "ultralytics" else P2_ENGINE_REF,
         "conf_deteccao": CONF_DETECCAO,
+        "nms_entre_classes": NMS_ENTRE_CLASSES,
         "preprocessamento": PREPROCESSAMENTO,
         "margem_recorte_pct": MARGEM_RECORTE_PCT,
         "margem_recorte_mercosul_pct": MARGEM_RECORTE_MERCOSUL_PCT,
@@ -559,7 +564,8 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
     de não ter sido publicada ou "" (leitura recusada pela validação ou publicação desligada).
     """
     # Inferencia no detector YOLO
-    yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False)[0]
+    yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False,
+                                       agnostic_nms=NMS_ENTRE_CLASSES)[0]
 
     caixas = []
     crops = []
@@ -899,7 +905,7 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
              if PRE_ALTURA_ALVO or PRE_NITIDEZ or PRE_PROPORCAO else "") + " | "
           f"margem={MARGEM_RECORTE_PCT:g}%"
           + (f" (Mercosul: {MARGEM_RECORTE_MERCOSUL_PCT:g}%)" if MARGEM_RECORTE_MERCOSUL_PCT is not None else "")
-          + f" | dobrar_2l={DOBRAR_2L}"
+          + f" | dobrar_2l={DOBRAR_2L} | nms_entre_classes={'sim' if NMS_ENTRE_CLASSES else 'nao'}"
           + (f" (divisão {DOBRAR_DIVISAO_PCT:g}%, folga {DOBRAR_FOLGA_PCT:g}%, "
              f"descarte do topo {DOBRAR_DESCARTE_TOPO_PCT:g}%)" if DOBRAR_2L != "nao" else ""))
     print(f"Publicação: modo={PUBLICACAO_MODO} | source_id={SOURCE_ID} | "
