@@ -12,6 +12,9 @@ python-dotenv>=1.0
 # --- Barramento de eventos (publicador_eventos.py, consumidor_teste.py) ---
 confluent-kafka>=2.3
 
+# --- Download de vídeos para teste (baixar_video.py) ---
+yt-dlp
+
 # --- Avaliação e gráficos (comprovacaoAcertos.py, comprovacaoResultados.py) ---
 pandas
 matplotlib

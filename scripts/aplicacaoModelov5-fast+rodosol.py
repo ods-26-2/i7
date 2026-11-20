@@ -13,7 +13,7 @@ Pipeline ALPR Personalizado:
 8. Experimentos de OCR controlados pelo .env (todos neutros por padrão): PREPROCESSAMENTO,
    MARGEM_RECORTE_PCT, DOBRAR_2L, DOBRAR_DIVISAO_PCT, OCR_MODELO. Cada execução grava um
    experimento.json com a configuração usada, e o resultados.csv inclui o texto BRUTO do OCR.
-9. Vídeo (--video arquivo.mp4): processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo do vídeo
+9. Vídeo (--video arquivo.mp4, trecho opcional com --inicio/--fim): processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo do vídeo
    e não republica a mesma placa enquanto ela continuar sendo lida (janela VIDEO_JANELA_REPETICAO_S).
 """
 import argparse
@@ -713,7 +713,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
 
 
 def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
-                    limite: int | None = None):
+                    limite: int | None = None, inicio: float = 0.0, fim: float | None = None):
     """
     Roda o pipeline em um arquivo de vídeo. Processa VIDEO_QUADROS_POR_SEGUNDO quadros por segundo
     do vídeo (os outros são pulados) e grava em `saida`: resultados.csv (uma linha por leitura,
@@ -721,7 +721,8 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
     O `frame_index` do evento é o número do quadro no vídeo (a partir de 0).
     A mesma placa só volta a ser publicada depois de ficar VIDEO_JANELA_REPETICAO_S segundos (tempo
     do vídeo) sem ser lida; as leituras barradas aparecem no CSV como "repetida".
-    Com `limite`, processa só os N primeiros quadros amostrados.
+    Com `limite`, processa só os N primeiros quadros amostrados. Com `inicio`/`fim` (segundos do
+    vídeo), processa só esse trecho; o número do quadro e o tempo continuam os do vídeo inteiro.
     """
     video = cv2.VideoCapture(str(caminho))
     if not video.isOpened():
@@ -733,16 +734,27 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
         print("[!] O vídeo não informa os quadros por segundo; usando 30.")
     total = int(video.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     passo = max(1, round(fps / VIDEO_QUADROS_POR_SEGUNDO))
-    previstos = math.ceil(total / passo) if total else None
+    primeiro = round(inicio * fps)                               # primeiro quadro do trecho
+    ultimo = math.floor(fim * fps) if fim is not None else None  # último quadro do trecho (incluído)
+    if total and primeiro >= total:
+        print(f"[!] --inicio ({inicio:g} s) está depois do fim do vídeo ({total / fps:.1f} s).")
+        video.release()
+        return
+    fim_trecho = min(ultimo + 1, total) if (ultimo is not None and total) else (ultimo + 1 if ultimo is not None else total)
+    previstos = math.ceil((fim_trecho - primeiro) / passo) if fim_trecho else None
     aviso = (f" | MODO TESTE: processando só {limite} quadro(s) amostrado(s)"
              if limite is not None and (previstos is None or limite < previstos) else "")
     print(f"\n[{caminho}] {total or '?'} quadros a {fps:.1f} q/s ({total / fps:.0f} s)" if total else
           f"\n[{caminho}] {fps:.1f} q/s", end="")
     print(f" | 1 a cada {passo} quadro(s) (~{fps / passo:.1f} por segundo){aviso}")
+    if inicio or fim is not None:
+        print(f"  Trecho: de {inicio:g} s até " + (f"{fim:g} s" if fim is not None else "o fim")
+              + f" (quadros {primeiro} a {ultimo if ultimo is not None else 'fim'})")
 
     saida.mkdir(parents=True, exist_ok=True)
     config = config_experimento(caminho, limite)
-    config.update({"video": str(caminho), "video_fps": fps, "video_quadros": total, "video_passo": passo})
+    config.update({"video": str(caminho), "video_fps": fps, "video_quadros": total, "video_passo": passo,
+                   "video_inicio_s": inicio, "video_fim_s": fim})
     (saida / "experimento.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     ultima_leitura = {}   # placa -> tempo (s, do vídeo) da última vez que foi lida
@@ -754,7 +766,9 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
         return anterior is None or tempo_atual - anterior >= VIDEO_JANELA_REPETICAO_S
 
     processados = com_placa = repetidas = 0
-    numero = -1
+    numero = primeiro - 1
+    if primeiro:
+        video.set(cv2.CAP_PROP_POS_FRAMES, primeiro)   # pula direto para o início do trecho
     with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
             criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
         escritor = csv.writer(arq_csv)
@@ -762,7 +776,9 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
                            "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado"])
         while limite is None or processados < limite:
             numero += 1
-            if numero % passo:
+            if ultimo is not None and numero > ultimo:
+                break
+            if (numero - primeiro) % passo:
                 if not video.grab():   # pula o quadro sem decodificar a imagem
                     break
                 continue
@@ -799,8 +815,13 @@ def processar_video(caminho: Path, saida: Path, modelo_yolo, ocr, construtor: Co
     print(f"Publicação: {publicador.resumo()}")
 
 
-def main(limite: int | None = None, video: str | None = None):
+def main(limite: int | None = None, video: str | None = None, inicio: float | None = None,
+         fim: float | None = None):
     caminho_video = None
+    if (inicio is not None or fim is not None) and not video:
+        raise SystemExit("[ERRO] --inicio e --fim só valem junto com --video.")
+    if inicio is not None and fim is not None and fim <= inicio:
+        raise SystemExit("[ERRO] --fim deve ser maior que --inicio.")
     if video:
         caminho_video = RAIZ / video.strip().strip('"').strip("'")
         if not caminho_video.is_file():
@@ -877,9 +898,12 @@ def main(limite: int | None = None, video: str | None = None):
     ocr = DefaultOCR(hub_ocr_model=OCR_MODELO)
 
     if caminho_video:
-        saida_video = PASTA_SAIDA / caminho_video.stem
+        # trechos diferentes do mesmo vídeo vão para pastas diferentes (não se sobrescrevem)
+        sufixo = (f"_{inicio or 0:g}-{fim:g}s" if fim is not None
+                  else f"_{inicio:g}s-fim" if inicio else "")
+        saida_video = PASTA_SAIDA / (caminho_video.stem + sufixo)
         print(f"  {caminho_video}  ->  {saida_video}")
-        processar_video(caminho_video, saida_video, modelo_yolo, ocr, construtor, limite)
+        processar_video(caminho_video, saida_video, modelo_yolo, ocr, construtor, limite, inicio or 0.0, fim)
     for pasta, saida in zip(pastas, saidas):
         if processar_pasta(pasta, saida, modelo_yolo, ocr, construtor, limite):
             break  # usuário pediu para sair
@@ -902,6 +926,21 @@ def inteiro_positivo(texto: str) -> int:
     return valor
 
 
+def segundos(texto: str) -> float:
+    """Aceita segundos (90 ou 90.5) ou minutos:segundos (1:30)."""
+    try:
+        if ":" in texto:
+            minutos, seg = texto.split(":", 1)
+            valor = int(minutos) * 60 + float(seg)
+        else:
+            valor = float(texto)
+    except ValueError:
+        valor = -1
+    if valor < 0:
+        raise argparse.ArgumentTypeError(f"'{texto}' não é um tempo válido (use 90, 90.5 ou 1:30)")
+    return valor
+
+
 def ler_argumentos():
     parser = argparse.ArgumentParser(
         description="Pipeline ALPR: YOLO próprio (4 classes) + OCR Fast-ALPR. "
@@ -914,9 +953,13 @@ def ler_argumentos():
         "--video", metavar="ARQUIVO", default=None,
         help="processa um vídeo (ex.: videos/portao.mp4, relativo à raiz do projeto) em vez das "
              "pastas de PASTA_IMAGENS. Saída em PASTA_SAIDA/<nome do vídeo>")
+    parser.add_argument("--inicio", type=segundos, default=None, metavar="TEMPO",
+                        help="com --video: começa neste ponto (segundos, ex.: 90, ou minutos:segundos, ex.: 1:30)")
+    parser.add_argument("--fim", type=segundos, default=None, metavar="TEMPO",
+                        help="com --video: para neste ponto (mesmo formato do --inicio)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     argumentos = ler_argumentos()
-    main(argumentos.limite, argumentos.video)
+    main(argumentos.limite, argumentos.video, argumentos.inicio, argumentos.fim)
