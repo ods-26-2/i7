@@ -62,6 +62,8 @@ curl -L -o "$d/cct_s_v2_global_plate_config.yaml" "$base/cct_s_v2_global_plate_c
 | Arquivo | Função |
 |---|---|
 | `aplicacaoModelov5-fast+rodosol.py` | **Pipeline atual:** YOLO de 4 classes + OCR + validação, com mosaicos, CSV e publicação de eventos. Lê pastas de imagens ou um vídeo (`--video`) |
+| `webcam_mjpeg.py` | Transmite a webcam (ou um vídeo em laço) como MJPEG por HTTP, para o I7 ler ao vivo com `--video <endereço>`. Roda fora do Docker |
+| `fonte_ao_vivo.py` | Lê uma transmissão ao vivo por endereço, guardando só o quadro mais recente. Usado pelo `--video` com endereço |
 | `fonte_p4.py` | Lê a stream do P4 (memória compartilhada local, protocolo `P4R1`) e converte os quadros para imagem. Usado pelo `--p4`; sozinho, `python scripts/fonte_p4.py video` testa a conexão |
 | `cortar_video.py` | Corta um trecho de um vídeo (sem `ffmpeg`), por exemplo para usar como câmera simulada do P4 |
 | `baixar_video.py` | Baixa um vídeo (ex.: do YouTube, com `yt-dlp`) para a pasta `videos/`, para depois rodar o pipeline com `--video` |
@@ -108,9 +110,10 @@ Copie `.env.example` para `.env` e ajuste. Caminhos relativos partem da raiz do 
 | `VIDEO_JANELA_REPETICAO_S` | `10` | `10` | Só com `--video`: a mesma placa só volta a ser publicada depois de ficar esse tempo (do vídeo) sem ser lida |
 | `VIDEO_CONFIANCA_MINIMA` | `LIMIAR_INCERTEZA` (0.9) | `0.9` | Só com `--video` ou `--p4`: só vira evento a leitura com confiança mínima >= este valor. `0` publica todas |
 | `P4_ESPERA_S` | `30` | `30` | Só com `--p4`: encerra a leitura depois deste tempo (s) sem quadros |
+| `SALVAR_MOSAICOS` | `publicados` | `publicados` | Só com `--video` ou `--p4`: `publicados` salva o mosaico só dos quadros em que alguma leitura virou evento; `todos`, todo quadro com placa; `nenhum`, nenhum (o CSV continua) |
 | `P4_BAYER` | `RGGB` | `RGGB` | Só com `--p4` e câmeras físicas: padrão do mosaico Bayer do `RG10`. Se as cores saírem trocadas, `BGGR` |
 | `KAFKA_TOPICO` | `ods.i7.plate_read` | idem | Tópico e campo `schema` dos eventos |
-| `KAFKA_BROKER` | `172.18.4.56:9092` | `172.18.4.56:9092` (dentro do Dcomp) ou `200.17.66.56:9092` (fora) | Endereço do broker da Jetson (temporário); na versão final será local. Ver "Acesso ao broker da Jetson" |
+| `KAFKA_BROKER` | `34.66.235.91:9093` | o **Kafka da nuvem** (endereço a confirmar com o TRA) | Na homologação, o I7 roda na Jetson e publica no Kafka da nuvem, onde o A8 consome. O Kafka da Jetson só serve para testes (ver "Acesso ao broker da Jetson") |
 
 Experimentais (sem ganho nos testes, ficam desligados): `DOBRAR_2L` (`nao`/`auto`/`fixo`/`separar`; `separar` lê cada linha da placa de moto sozinha e junta o resultado, ainda em avaliação), `DOBRAR_DIVISAO_PCT`, `DOBRAR_FOLGA_PCT`, `DOBRAR_DESCARTE_TOPO_PCT`. Pré-processamento do recorte: `PRE_ALTURA_ALVO=160` (amplia o recorte até essa altura em pixels) e `PRE_PROPORCAO=2` (completa as laterais do recorte até uma proporção largura/altura, em vez de esticar) estão recomendados no `.env.example`: nas 400 motos subiram de 71,8% para 75,5% de placas corretas e os carros ficaram iguais. `PRE_NITIDEZ` (realce de nitidez) piorou nos testes e fica em 0. Com 0 em todos, vale o comportamento original.
 
@@ -151,6 +154,19 @@ python scripts/aplicacaoModelov5-fast+rodosol.py --video videos/portao.mp4 --ini
 
 Testes com vídeos de demonstração de câmeras LPR (placas brasileiras): as placas nítidas foram lidas corretamente e publicadas uma vez cada; as leituras erradas de placas ainda distantes ficaram abaixo de 0,9 e não viraram evento.
 
+### Ao vivo pela webcam (demonstração)
+
+O `--video` também aceita um endereço (`http://...` ou `rtsp://...`) e lê ao vivo, sempre o quadro mais recente (sem acumular atraso), com as mesmas regras e saídas do P4 (pasta `saidas/ao_vivo`). Para usar a webcam do notebook (o Docker do Windows não enxerga a webcam, então ela é transmitida de fora):
+
+```bash
+# terminal 1, FORA do Docker (precisa de: pip install opencv-python)
+python scripts/webcam_mjpeg.py --previa
+# terminal 2: use o endereço que o terminal 1 mostrar
+./run.sh scripts/aplicacaoModelov5-fast+rodosol.py --video "http://host.docker.internal:8080/video?t=..."
+```
+
+O endereço leva um código aleatório (`?t=...`) a cada execução, para a webcam não ficar aberta para a rede. A webcam tem pouca resolução: a placa precisa ocupar boa parte da imagem (placa impressa ou na tela do celular, a meio metro). Isso não passa pelo P4; para testar a integração, use o `--p4`. `P4_ESPERA_S` também vale aqui (encerra após esse tempo sem quadros).
+
 ### Stream do P4 (câmeras da Jetson)
 
 O P4 (SIS-2) publica cada quadro numa memória compartilhada **local** (um socket por câmera em `/tmp`, protocolo `P4R1`). Com `--p4 imx519`, `--p4 imx477` ou `--p4 video` (MP4 reproduzido como câmera), o I7 lê esses quadros e aplica as mesmas regras do vídeo (janela de repetição e confiança mínima, com o tempo real de leitura). O I7 pega sempre o quadro mais recente; os que chegam enquanto ele processa são descartados, sem acumular atraso. O `frame_index` do evento é o `frame_id` do P4 e o `session_id` é o da sessão do P4. Para com `-n`, Ctrl+C ou `P4_ESPERA_S` segundos sem quadros; se o P4 ainda não estiver ligado, espera.
@@ -180,6 +196,8 @@ Testado assim no Windows (Docker Desktop): o I7 conectou sozinho quando o P4 lig
 ## Publicação de eventos (Kafka)
 
 Cada leitura **aceita pela validação de formato** vira um evento `ods.i7.plate_read`. Leituras recusadas não geram evento.
+
+**Validação:** antes de gravar ou enviar, cada evento passa pela validação própria (`validar_evento`, mais rígida) e pela biblioteca oficial **`ods-validator`** (TRA-2; JSON Schemas da Especificação 1.0, repositório `ods-26-2/b1`, versão fixada no `requirements.txt`). Evento que falha em qualquer uma é descartado, com o motivo no terminal. Para conferir um arquivo: `python scripts/publicador_eventos.py --validar saidas/<pasta>/eventos.jsonl`. Os eventos dos testes com imagens, vídeo e P4 passaram no schema oficial.
 
 **Envelope** (guia do Kafka B2 + Arquitetura 6c): `message_type` (`event`), `message_id`, `schema` (igual ao nome do tópico), `schema_version`, `producer` (`I7`), `occurred_at`, `published_at`, `captured_at`, `source_id`, `session_id`, `sequence`, `artifact_version` e `payload`. O `occurred_at` **não consta na arquitetura 6c** (que usa `captured_at` e `published_at`): foi acrescentado porque o guia do Kafka B2 o define como campo obrigatório do envelope. Tem o mesmo valor de `captured_at` (quando o veículo foi visto).
 
@@ -226,6 +244,8 @@ Um evento de exemplo completo sai de `python scripts/publicador_eventos.py --exe
 
 ### Acesso ao broker da Jetson
 
+> **Na homologação, o I7 publica no Kafka da nuvem** (arquitetura definida em 23/11: camadas de plataforma e inferência na Jetson, barramento e camadas de cima na nuvem). Esta seção só vale para testes no Kafka **local** da Jetson.
+
 O broker (`172.18.4.56:9092`, sem TLS) fica na rede do Dcomp. De dentro dela use esse endereço; de fora, o público (`200.17.66.56:9092`), que não funciona de dentro. Teste a porta antes: `nc -zv -w 5 <ip> 9092` (Linux) ou `Test-NetConnection <ip> -Port 9092` (PowerShell).
 
 **Problema do `localhost:9092`.** O broker ainda anuncia `localhost:9092` (`advertised.listeners`). O cliente conecta, recebe esse endereço e falha com `Connect to ipv4#127.0.0.1:9092 failed`. A correção definitiva é no broker (anunciar o endereço real). Enquanto isso, use uma **ponte** (`socat`) e rode o container na rede dela. São dois terminais:
@@ -264,7 +284,8 @@ Se o `docker network` do seu computador (por exemplo, a rede `a8_default` do Com
 ## Saídas (em cada pasta de saída)
 
 - `<imagem>_mosaico.jpg`: imagem com a detecção, o recorte que o OCR viu e o texto lido.
-- `resultados.csv`: imagem, placa lida, tipo, confiança da detecção, confiança média do OCR, **texto bruto do OCR**, confiança mínima e confiança por caractere. No vídeo, `quadro` e `tempo_s` no lugar de `imagem`, mais a coluna `publicado`.
+- `resultados.csv`: imagem, placa lida, tipo, confiança da detecção, confiança média do OCR, **texto bruto do OCR**, confiança mínima e confiança por caractere. No vídeo e no P4, `quadro` e `tempo_s` no lugar de `imagem`, mais `publicado`, `capturado_em`, `message_id` (o mesmo do evento no Kafka) e `mosaico` (o arquivo daquela leitura): a partir de uma decisão do A8, dá para achar o mosaico da leitura.
+- No vídeo e no P4, só os quadros com evento publicado geram mosaico (`SALVAR_MOSAICOS=publicados`). No P4 o `resultados.csv` acumula entre execuções e o mosaico leva data/hora UTC da captura e a placa no nome (ex.: `20261125T221530Z_EQX4670_q000123.jpg`), para nada ser sobrescrito.
 - `eventos.jsonl`: um evento `ods.i7.plate_read` por leitura aceita pela validação (só no modo `arquivo`).
 - `experimento.json`: a configuração usada na execução.
 - Pelo `comprovacaoAcertos.py`: `acertos_detalhado.csv` (placa real × lida por imagem), `dashboard_acertos.png` e, com `--comparar`, `comparacao_experimentos.csv`.
