@@ -35,7 +35,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fast_alpr.default_ocr import DefaultOCR
 
-from publicador_eventos import ConstrutorEventos, agora_utc, criar_publicador
+from publicador_eventos import ConstrutorEventos, agora_utc, criar_publicador, formatar_instante
 
 # =========================== VARIÁVEIS GLOBAIS ===========================
 RAIZ = Path(__file__).resolve().parent.parent
@@ -103,6 +103,11 @@ EXTENSOES_VIDEO = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 # --- Stream do P4 (--p4) --- usa também VIDEO_JANELA_REPETICAO_S e VIDEO_CONFIANCA_MINIMA
 P4_ESPERA_S = env_numero("P4_ESPERA_S", 30)   # encerra depois deste tempo sem receber quadros do P4
+
+# --- Mosaicos no vídeo e no P4 --- (no modo de pastas, todo quadro gera mosaico, como sempre)
+# publicados = só os quadros em que alguma leitura virou evento (placa válida, confiável e não repetida)
+# todos = todo quadro com placa detectada | nenhum = não salva mosaicos (o resultados.csv continua)
+SALVAR_MOSAICOS = os.getenv("SALVAR_MOSAICOS", "publicados").strip().lower()
 
 CONF_DETECCAO = 0.25
 # Supressão de caixas sobrepostas também entre classes diferentes (sim | nao). Com "nao" (padrão da
@@ -459,6 +464,7 @@ def config_experimento(pasta: Path, limite: int | None) -> dict:
         "video_quadros_por_segundo": VIDEO_QUADROS_POR_SEGUNDO,
         "video_janela_repeticao_s": VIDEO_JANELA_REPETICAO_S,
         "video_confianca_minima": VIDEO_CONFIANCA_MINIMA,
+        "salvar_mosaicos": SALVAR_MOSAICOS,
     }
 
 
@@ -567,8 +573,9 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
     `nome` só aparece nas mensagens; `frame_index` e `capturado_em` vão para o evento.
     `decidir_publicacao(placa, conf_min)`, se informado, decide se uma leitura aceita vira evento
     (no vídeo: "sim", "repetida" ou "baixa_confianca"). Devolve (caixas, crops, resultados, extras,
-    publicacao), usados no mosaico e no resultados.csv. `publicacao`, por leitura: "sim", o motivo
-    de não ter sido publicada ou "" (leitura recusada pela validação ou publicação desligada).
+    publicacao, ids_eventos), usados no mosaico e no resultados.csv. `publicacao`, por leitura: "sim",
+    o motivo de não ter sido publicada ou "" (leitura recusada pela validação ou publicação desligada);
+    `ids_eventos`: o message_id do evento publicado (ou "").
     """
     # Inferencia no detector YOLO
     yolo_results = modelo_yolo.predict(img, conf=CONF_DETECCAO, verbose=False,
@@ -578,7 +585,8 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
     crops = []
     resultados = []
     extras = []  # por placa, alinhada às listas acima: (texto bruto, confiança mínima, confianças)
-    publicacao = []  # por placa: "sim" (evento gerado), "repetida", "baixa_confianca" ou ""
+    publicacao = []  # por placa: "sim" (evento gerado), "repetida", "baixa_confianca", "descartado" ou ""
+    ids_eventos = []  # por placa: message_id do evento publicado (ou "")
 
     for indice_deteccao, box in enumerate(yolo_results.boxes):
         conf_det = float(box.conf[0])
@@ -634,6 +642,7 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
         placa_validada, status_tipo = processar_leitura(texto_ocr, rotulo_classe)
 
         publicado = ""
+        id_evento = ""
         # Evento ods.i7.plate_read, só para leituras ACEITAS pela validação
         # (processar_leitura devolve o rótulo da classe sem sufixo quando a placa é válida).
         if (publicador.ativo and status_tipo == rotulo_classe
@@ -646,23 +655,27 @@ def processar_quadro(img, nome: str, frame_index: int, capturado_em, modelo_yolo
                     (decisao := decidir_publicacao(placa_validada, conf_min)) != "sim":
                 publicado = decisao
             else:
-                publicado = "sim"
-                publicador.publicar(construtor.plate_read(
+                evento = construtor.plate_read(
                     placa=placa_validada, plate_layout=layout_placa, classe_veiculo=classe_veiculo,
                     confianca=conf_min,  # MENOR confiança entre os caracteres (separa melhor leituras boas das ruins que a média)
                     character_confidences=confs_7,
                     uncertain=conf_min < LIMIAR_INCERTEZA,
                     bbox=[max(x1, 0), max(y1, 0), x2, y2], frame_index=frame_index,
                     detection_id=indice_deteccao,  # GENÉRICO: índice da detecção no quadro (não acompanha o veículo)
-                    captured_at=capturado_em))
+                    captured_at=capturado_em)
+                if publicador.publicar(evento):
+                    publicado, id_evento = "sim", evento["message_id"]
+                else:
+                    publicado = "descartado"   # violou o contrato (o motivo já foi mostrado no terminal)
 
         caixas.append((x1, y1, x2, y2, conf_det, status_tipo))
         crops.append(entrada_ocr)  # no mosaico: o que o OCR "viu" (com margem / dobrada, se for o caso)
         resultados.append((placa_validada, conf_ocr, status_tipo, conf_det))
         extras.append((texto_ocr, conf_min, confs_txt))
         publicacao.append(publicado)
+        ids_eventos.append(id_evento)
 
-    return caixas, crops, resultados, extras, publicacao
+    return caixas, crops, resultados, extras, publicacao, ids_eventos
 
 
 def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
@@ -702,7 +715,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
                 continue
             capturado_em = agora_utc()  # instante da captura (aqui: leitura da imagem do disco)
 
-            caixas, crops, resultados, extras, _ = processar_quadro(
+            caixas, crops, resultados, extras, _, _ = processar_quadro(
                 img, caminho.name, i - 1, capturado_em, modelo_yolo, ocr, construtor, publicador)
 
             mosaico = juntar(desenhar_deteccoes(img, caixas),
@@ -729,7 +742,7 @@ def processar_pasta(pasta: Path, saida: Path, modelo_yolo, ocr, construtor: Cons
 
 
 def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, construtor: ConstrutorEventos,
-                      limite: int | None = None, origem_tempo: str = "do vídeo"):
+                      limite: int | None = None, origem_tempo: str = "do vídeo", acumular: bool = False):
     """
     Parte comum do vídeo e da stream do P4. `quadros` é um iterador de (numero, tempo_s, img): o número
     do quadro vai para o `frame_index` do evento e o tempo (em segundos) controla a janela de repetição.
@@ -738,6 +751,10 @@ def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, cons
     Só vira evento a leitura com confiança mínima >= VIDEO_CONFIANCA_MINIMA (as outras aparecem no CSV
     como "baixa_confianca"). A mesma placa só volta a ser publicada depois de ficar
     VIDEO_JANELA_REPETICAO_S segundos sem ser lida; as leituras barradas aparecem no CSV como "repetida".
+    Mosaicos conforme SALVAR_MOSAICOS (padrão: só quadros com evento publicado). O CSV liga cada leitura
+    ao evento (`message_id`) e ao mosaico. Com `acumular` (stream do P4), o resultados.csv recebe as novas
+    linhas no fim em vez de ser reescrito, e os mosaicos levam a data/hora da captura e as placas no nome,
+    para nada ser sobrescrito entre execuções.
     Com `limite`, para depois de N quadros processados. Ctrl+C encerra normalmente (grava o que já leu).
     """
     saida.mkdir(parents=True, exist_ok=True)
@@ -756,12 +773,16 @@ def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, cons
         ultima_leitura[placa] = tempo_atual
         return "sim"
 
-    processados = com_placa = repetidas = baixas = 0
-    with open(saida / "resultados.csv", "w", newline="", encoding="utf-8") as arq_csv, \
+    processados = com_placa = repetidas = baixas = mosaicos = 0
+    caminho_csv = saida / "resultados.csv"
+    novo_csv = not (acumular and caminho_csv.exists())
+    with open(caminho_csv, "w" if novo_csv else "a", newline="", encoding="utf-8") as arq_csv, \
             criar_publicador(PUBLICACAO_MODO, saida / "eventos.jsonl") as publicador:
         escritor = csv.writer(arq_csv)
-        escritor.writerow(["quadro", "tempo_s", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
-                           "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado"])
+        if novo_csv:
+            escritor.writerow(["quadro", "tempo_s", "placa_lida", "tipo_detectado", "conf_det", "conf_ocr",
+                               "texto_ocr_bruto", "conf_ocr_min", "conf_ocr_por_char", "publicado",
+                               "capturado_em", "message_id", "mosaico"])
         try:
             for numero, tempo, img in quadros:
                 if limite is not None and processados >= limite:
@@ -770,7 +791,7 @@ def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, cons
                 tempo_atual = tempo
                 capturado_em = agora_utc()  # instante da leitura do quadro (o arquivo não tem a hora real)
 
-                caixas, crops, resultados, extras, publicacao = processar_quadro(
+                caixas, crops, resultados, extras, publicacao, ids_eventos = processar_quadro(
                     img, f"quadro {numero}", numero, capturado_em, modelo_yolo, ocr, construtor, publicador,
                     decidir_publicacao)
                 if not resultados:
@@ -781,12 +802,22 @@ def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, cons
                 com_placa += 1
                 repetidas += publicacao.count("repetida")
                 baixas += publicacao.count("baixa_confianca")
-                mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
-                cv2.imwrite(str(saida / f"quadro_{numero:06d}_mosaico.jpg"), mosaico)
-                for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub in zip(
-                        resultados, extras, publicacao):
+                nome_mosaico = ""
+                if SALVAR_MOSAICOS == "todos" or (SALVAR_MOSAICOS == "publicados" and "sim" in publicacao):
+                    if acumular:   # nome único: data/hora UTC da captura + placas publicadas + quadro
+                        placas = "-".join(r[0] for r, p in zip(resultados, publicacao) if p == "sim") or "sem_evento"
+                        nome_mosaico = f"{capturado_em:%Y%m%dT%H%M%S}Z_{placas}_q{numero:06d}.jpg"
+                    else:
+                        nome_mosaico = f"quadro_{numero:06d}_mosaico.jpg"
+                    mosaico = juntar(desenhar_deteccoes(img, caixas), montar_painel(crops, resultados))
+                    cv2.imwrite(str(saida / nome_mosaico), mosaico)
+                    mosaicos += 1
+                for (placa, conf_ocr, tipo, conf_det), (bruto, conf_min, confs_txt), pub, id_evento in zip(
+                        resultados, extras, publicacao, ids_eventos):
                     escritor.writerow([numero, f"{tempo_atual:.2f}", placa, tipo, f"{conf_det:.3f}",
-                                       f"{conf_ocr:.3f}", bruto, f"{conf_min:.3f}", confs_txt, pub])
+                                       f"{conf_ocr:.3f}", bruto, f"{conf_min:.3f}", confs_txt, pub,
+                                       formatar_instante(capturado_em), id_evento, nome_mosaico])
+                arq_csv.flush()   # no P4 a execução é longa: o CSV fica em dia mesmo se o I7 for derrubado
                 print(f"[{tempo_atual:7.2f} s | quadro {numero}] "
                       + ", ".join(r[0] + (f" ({p.replace('_', ' ')})" if p not in ("sim", "") else "")
                                   for r, p in zip(resultados, publicacao)))
@@ -795,7 +826,7 @@ def processar_quadros(quadros, saida: Path, config: dict, modelo_yolo, ocr, cons
 
     print(f"{processados} quadro(s) processado(s), {com_placa} com placa. Não publicadas: {repetidas} por repetição "
           f"(janela de {VIDEO_JANELA_REPETICAO_S:g} s), {baixas} por baixa confiança (< {VIDEO_CONFIANCA_MINIMA:g}).")
-    print(f"Resultados salvos em: {saida}")
+    print(f"Mosaicos salvos ({SALVAR_MOSAICOS}): {mosaicos}. Resultados em: {saida}")
     print(f"Publicação: {publicador.resumo()}")
 
 
@@ -893,7 +924,36 @@ def processar_p4(fonte: str, saida: Path, modelo_yolo, ocr, construtor: Construt
                           f"{campos.get('width')}x{campos.get('height')} {campos.get('format')}")
                 yield int(campos.get("frame_id", 0)), time.monotonic() - inicio, img
 
-    processar_quadros(quadros(), saida, config, modelo_yolo, ocr, construtor, limite, "de leitura")
+    processar_quadros(quadros(), saida, config, modelo_yolo, ocr, construtor, limite, "de leitura", acumular=True)
+
+
+def processar_ao_vivo(endereco: str, saida: Path, modelo_yolo, ocr, construtor: ConstrutorEventos,
+                      limite: int | None = None):
+    """
+    Lê uma transmissão ao vivo por endereço (ex.: a webcam pelo scripts/webcam_mjpeg.py, ou uma câmera IP)
+    e roda o pipeline sempre no quadro mais recente, como na stream do P4: os quadros que chegam enquanto o
+    I7 processa são descartados, sem acumular atraso. Mesmas regras e saídas do P4 (janela de repetição,
+    confiança mínima, mosaicos só das leituras publicadas, CSV acumulado). Para com `limite` quadros,
+    Ctrl+C ou P4_ESPERA_S segundos sem quadros; se a transmissão cair, tenta reconectar.
+    """
+    from fonte_ao_vivo import LeitorAoVivo
+
+    print(f"\n[AO VIVO] lendo {endereco.split('?')[0]} | espera até {P4_ESPERA_S:g} s por quadros"
+          + (f" | MODO TESTE: {limite} quadro(s)" if limite is not None else " | Ctrl+C para encerrar"))
+    config = config_experimento(Path("ao_vivo"), limite)
+    config.update({"ao_vivo": endereco.split("?")[0], "espera_s": P4_ESPERA_S})
+    inicio = time.monotonic()
+
+    def quadros():
+        with LeitorAoVivo(endereco) as leitor:
+            primeiro = True
+            for numero, img in leitor.quadros(P4_ESPERA_S):
+                if primeiro:
+                    print(f"[AO VIVO] recebendo {img.shape[1]}x{img.shape[0]}")
+                    primeiro = False
+                yield numero, time.monotonic() - inicio, img
+
+    processar_quadros(quadros(), saida, config, modelo_yolo, ocr, construtor, limite, "de leitura", acumular=True)
 
 
 def _uuid_valido(texto) -> bool:
@@ -906,9 +966,16 @@ def _uuid_valido(texto) -> bool:
 def main(limite: int | None = None, video: str | None = None, inicio: float | None = None,
          fim: float | None = None, p4: str | None = None):
     caminho_video = None
+    ao_vivo = None   # --video com endereço (http://, rtsp://...): transmissão ao vivo, ex.: webcam_mjpeg.py
     if video and p4:
         raise SystemExit("[ERRO] Use --video ou --p4, não os dois.")
-    if (inicio is not None or fim is not None) and not video:
+    if video:
+        from fonte_ao_vivo import eh_endereco
+        if eh_endereco(video):
+            ao_vivo, video = video.strip(), None
+            if inicio is not None or fim is not None:
+                raise SystemExit("[ERRO] --inicio e --fim não valem para transmissão ao vivo.")
+    if (inicio is not None or fim is not None) and not video and not ao_vivo:
         raise SystemExit("[ERRO] --inicio e --fim só valem junto com --video.")
     if inicio is not None and fim is not None and fim <= inicio:
         raise SystemExit("[ERRO] --fim deve ser maior que --inicio.")
@@ -918,18 +985,22 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
             raise SystemExit(f"[ERRO] Vídeo não encontrado: {caminho_video}")
         if caminho_video.suffix.lower() not in EXTENSOES_VIDEO:
             print(f"[!] Extensão {caminho_video.suffix} incomum para vídeo; tentando abrir mesmo assim.")
+        if SALVAR_MOSAICOS not in ("publicados", "todos", "nenhum"):
+            raise SystemExit("[ERRO] SALVAR_MOSAICOS deve ser publicados, todos ou nenhum.")
         if VIDEO_QUADROS_POR_SEGUNDO <= 0 or VIDEO_JANELA_REPETICAO_S < 0 or not 0 <= VIDEO_CONFIANCA_MINIMA <= 1:
             raise SystemExit("[ERRO] VIDEO_QUADROS_POR_SEGUNDO deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
                              "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
         pastas, saidas = [], []
-    elif p4:
+    elif p4 or ao_vivo:
+        if SALVAR_MOSAICOS not in ("publicados", "todos", "nenhum"):
+            raise SystemExit("[ERRO] SALVAR_MOSAICOS deve ser publicados, todos ou nenhum.")
         if P4_ESPERA_S <= 0 or VIDEO_JANELA_REPETICAO_S < 0 or not 0 <= VIDEO_CONFIANCA_MINIMA <= 1:
             raise SystemExit("[ERRO] P4_ESPERA_S deve ser > 0, VIDEO_JANELA_REPETICAO_S >= 0 "
                              "e VIDEO_CONFIANCA_MINIMA entre 0 e 1.")
         pastas, saidas = [], []
     else:
         pastas = listar_pastas(PASTAS_IMAGENS_BRUTO)
-    if not pastas and not caminho_video and not p4:
+    if not pastas and not caminho_video and not p4 and not ao_vivo:
         raise SystemExit("[ERRO] PASTA_IMAGENS está vazia. Informe uma pasta ou uma lista separada por vírgula.")
 
     ausentes = [p for p in pastas if not p.is_dir()]
@@ -938,7 +1009,7 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
                          "\n  ".join(str(p) for p in ausentes))
 
     # Uma pasta: grava direto em PASTA_SAIDA. Várias: uma subpasta de saída por pasta de entrada.
-    if caminho_video or p4:
+    if caminho_video or p4 or ao_vivo:
         pass
     elif len(pastas) == 1:
         saidas = [PASTA_SAIDA]
@@ -977,6 +1048,8 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
               if caminho_video
               else f"stream do P4 '{p4}' (janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, "
                    f"confiança mínima {VIDEO_CONFIANCA_MINIMA:g})" if p4
+              else f"transmissão ao vivo (janela de repetição {VIDEO_JANELA_REPETICAO_S:g} s, "
+                   f"confiança mínima {VIDEO_CONFIANCA_MINIMA:g})" if ao_vivo
               else f"{len(pastas)} pasta(s) de imagens")
     print(f"Detector: {nome_detector} | OCR: Fast-ALPR ({OCR_MODELO}) | {origem}")
     print(f"Experimento: preprocessamento={'sim' if PREPROCESSAMENTO else 'nao'}"
@@ -1007,6 +1080,10 @@ def main(limite: int | None = None, video: str | None = None, inicio: float | No
         saida_p4 = PASTA_SAIDA / ("p4_" + re.sub(r"[^A-Za-z0-9_-]+", "_", Path(p4).name.removeprefix("p4_")))
         print(f"  P4 '{p4}'  ->  {saida_p4}")
         processar_p4(p4, saida_p4, modelo_yolo, ocr, construtor, limite)
+    if ao_vivo:
+        saida_vivo = PASTA_SAIDA / "ao_vivo"
+        print(f"  {ao_vivo.split('?')[0]}  ->  {saida_vivo}")
+        processar_ao_vivo(ao_vivo, saida_vivo, modelo_yolo, ocr, construtor, limite)
     for pasta, saida in zip(pastas, saidas):
         if processar_pasta(pasta, saida, modelo_yolo, ocr, construtor, limite):
             break  # usuário pediu para sair
@@ -1055,7 +1132,8 @@ def ler_argumentos():
     parser.add_argument(
         "--video", metavar="ARQUIVO", default=None,
         help="processa um vídeo (ex.: videos/portao.mp4, relativo à raiz do projeto) em vez das "
-             "pastas de PASTA_IMAGENS. Saída em PASTA_SAIDA/<nome do vídeo>")
+             "pastas de PASTA_IMAGENS. Saída em PASTA_SAIDA/<nome do vídeo>. Com um endereço "
+             "(http://... ou rtsp://..., ex.: a webcam do webcam_mjpeg.py), lê ao vivo; saída em PASTA_SAIDA/ao_vivo")
     parser.add_argument(
         "--p4", metavar="FONTE", default=None,
         help="lê a stream do P4 na mesma máquina: video, imx519, imx477 ou o caminho do socket "
